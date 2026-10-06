@@ -654,6 +654,109 @@ describe("agy-local execute run outcome", () => {
     const lastCallOptions = calls[calls.length - 1][3] as { stdin?: string };
     expect(lastCallOptions?.stdin).toBeUndefined();
   });
+  it("suppresses a stale quota error from a resumed conversation that already produced a terminal response", async () => {
+    vi.mocked(runChildProcess).mockClear();
+    const stdout = [
+      '{"event":"init","conversation_id":"conv-stale"}',
+      '{"event":"result","result":{"conversation_id":"conv-stale","status":"ERROR","response":"DELIVERED","error":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h39m17s.","usage":{"input_tokens":150,"output_tokens":20,"cache_read_tokens":70}}}',
+    ].join("\n");
+    vi.mocked(runChildProcess).mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout,
+      stderr: "",
+    } as Awaited<ReturnType<typeof runChildProcess>>);
+
+    const result = await execute({
+      runId: "run-stale-quota",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Test Agent",
+        adapterType: "agy_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "conv-stale",
+        sessionParams: {
+          sessionId: "conv-stale",
+          cwd: "/tmp/workspace",
+          usageTotals: { inputTokens: 100, outputTokens: 10, cachedInputTokens: 50 },
+        },
+        sessionDisplayId: "conv-stale",
+        taskKey: "issue-1",
+      },
+      config: {},
+      context: { paperclipWorkspace: { cwd: "/tmp/workspace" } },
+      onLog: async () => {},
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeNull();
+    expect(result.errorMessage).toBeNull();
+    expect(result.sessionId).toBeNull();
+    expect(result.clearSession).toBe(true);
+    expect(result.usage).toEqual({
+      inputTokens: 50,
+      outputTokens: 10,
+      cachedInputTokens: 20,
+    });
+    expect((result.resultJson as Record<string, unknown>).stale_quota_error_suppressed).toBe(true);
+    expect(vi.mocked(runChildProcess)).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns only the usage delta for a resumed conversation with a persisted baseline", async () => {
+    vi.mocked(runChildProcess).mockClear();
+    const stdout = [
+      '{"event":"init","conversation_id":"conv-usage"}',
+      '{"event":"result","result":{"conversation_id":"conv-usage","status":"SUCCESS","response":"OK","usage":{"input_tokens":450,"output_tokens":60,"cache_read_tokens":210}}}',
+    ].join("\n");
+    vi.mocked(runChildProcess).mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout,
+      stderr: "",
+    } as Awaited<ReturnType<typeof runChildProcess>>);
+
+    const result = await execute({
+      runId: "run-usage-delta",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Test Agent",
+        adapterType: "agy_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "conv-usage",
+        sessionParams: {
+          sessionId: "conv-usage",
+          cwd: "/tmp/workspace",
+          usageTotals: { inputTokens: 300, outputTokens: 40, cachedInputTokens: 150 },
+        },
+        sessionDisplayId: "conv-usage",
+        taskKey: "issue-1",
+      },
+      config: {},
+      context: { paperclipWorkspace: { cwd: "/tmp/workspace" } },
+      onLog: async () => {},
+    });
+
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.usage).toEqual({
+      inputTokens: 150,
+      outputTokens: 20,
+      cachedInputTokens: 60,
+    });
+    expect((result.sessionParams as Record<string, any>).usageTotals).toEqual({
+      inputTokens: 450,
+      outputTokens: 60,
+      cachedInputTokens: 210,
+    });
+  });
+
 });
 
 describe("discoverAgySessionArtifacts", () => {
