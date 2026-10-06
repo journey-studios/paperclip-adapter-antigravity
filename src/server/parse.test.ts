@@ -215,6 +215,7 @@ describe("failure and session error classification", () => {
     expect(detectAgyAuthRequired({ stderr: "some other failure" }).requiresAuth).toBe(false);
 
     expect(detectAgyQuotaExhausted({ stderr: "RESOURCE_EXHAUSTED" })).toBe(true);
+    expect(detectAgyQuotaExhausted({ stderr: "Individual quota reached. Resets in 1h39m17s." })).toBe(true);
     expect(detectAgyQuotaExhausted({ stderr: "429 too many requests" })).toBe(true);
     expect(detectAgyQuotaExhausted({ stderr: "file not found" })).toBe(false);
 
