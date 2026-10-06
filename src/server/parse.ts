@@ -93,6 +93,10 @@ export interface ParsedAgyOutput {
   permissionMode: string | null;
   assistantText: string;
   malformedLines: number;
+  /** True when this invocation completed an assistant-response step. */
+  completedAssistantResponse: boolean;
+  /** True when this invocation emitted an explicit current-turn error_message step. */
+  sawErrorStep: boolean;
 }
 
 export type AgyParsedStream = ParsedAgyOutput;
@@ -170,6 +174,8 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
   const availableTools: string[] = [];
   let assistantText = "";
   let malformedLines = 0;
+  let completedAssistantResponse = false;
+  let sawErrorStep = false;
   let sawJsonEvent = false;
 
   const toolsByStep = new Map<number, AgyToolInvocation>();
@@ -220,9 +226,12 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
       const stepType = asString(stepUpdate.step_type, "");
       const state = asString(stepUpdate.state, "");
 
+      if (stepType === "error_message") sawErrorStep = true;
+
       if (stepType === "agent_response") {
         const delta = typeof stepUpdate.text_delta === "string" ? stepUpdate.text_delta : "";
         if (delta) assistantText += delta;
+        if (state === "DONE") completedAssistantResponse = true;
       }
 
       if (stepType === "tool") {
@@ -340,6 +349,8 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
     permissionMode,
     assistantText,
     malformedLines,
+    completedAssistantResponse,
+    sawErrorStep,
   };
 }
 
