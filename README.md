@@ -88,15 +88,20 @@ Add the adapter to `/paperclip/adapter-plugins.json`:
 ]
 ```
 
-Restart or trigger reload on Paperclip:
+### 4. Enable Quota Bars in UI (Optional / Quick Patch)
+
+Paperclip v0.3.x limits the frontend Subscription Quota card to `anthropic` and `openai` by default. To display the Google quota bars:
 
 ```bash
-# If using Docker Compose:
-docker compose restart paperclip-app
-
-# Or trigger hot reload via Paperclip API:
-curl -X POST http://localhost:3100/api/adapters/agy_local/reload
+sh scripts/patch-ui.sh
 ```
+
+### 5. Restart Paperclip
+
+```bash
+docker compose restart paperclip-app
+```
+
 
 ---
 
