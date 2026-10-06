@@ -91,4 +91,19 @@ describe("agy-local sessionCodec", () => {
     expect(sessionCodec.getDisplayId?.(null)).toBeNull();
     expect(sessionCodec.getDisplayId?.({})).toBeNull();
   });
+  it("preserves cumulative usage totals used to derive heartbeat deltas", () => {
+    const params = {
+      sessionId: "conv-usage",
+      cwd: "/tmp/workspace",
+      usageTotals: {
+        inputTokens: 450,
+        outputTokens: 60,
+        cachedInputTokens: 210,
+      },
+    };
+    const encoded = sessionCodec.serialize(params);
+    expect(encoded).toEqual(params);
+    expect(sessionCodec.deserialize(encoded)).toEqual(params);
+  });
+
 });
