@@ -91,6 +91,22 @@ describe("agy-local sessionCodec", () => {
     expect(sessionCodec.getDisplayId?.(null)).toBeNull();
     expect(sessionCodec.getDisplayId?.({})).toBeNull();
   });
+  it("drops invalid or unrecognized usage baselines", () => {
+    expect(
+      sessionCodec.deserialize({
+        sessionId: "conv-invalid",
+        usageTotals: { inputTokens: Number.NaN },
+      }),
+    ).toEqual({ sessionId: "conv-invalid" });
+
+    expect(
+      sessionCodec.deserialize({
+        sessionId: "conv-unknown",
+        usageTotals: { arbitraryCounter: 123 },
+      }),
+    ).toEqual({ sessionId: "conv-unknown" });
+  });
+
   it("preserves cumulative usage totals used to derive heartbeat deltas", () => {
     const params = {
       sessionId: "conv-usage",
