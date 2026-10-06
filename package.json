@@ -1,0 +1,61 @@
+{
+  "name": "paperclip-adapter-antigravity",
+  "version": "1.0.0",
+  "description": "Standalone Paperclip external adapter for Google Antigravity (agy)",
+  "type": "module",
+  "license": "MIT",
+  "author": "Journey Studios",
+  "keywords": [
+    "paperclip",
+    "paperclip-adapter",
+    "antigravity",
+    "agy",
+    "gemini",
+    "ai-agent"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js",
+      "default": "./dist/server/index.js"
+    },
+    "./ui": {
+      "types": "./dist/ui/index.d.ts",
+      "import": "./dist/ui/index.js",
+      "default": "./dist/ui/index.js"
+    },
+    "./ui-parser": "./dist/ui-parser.cjs"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "files": [
+    "dist",
+    "ui-parser.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

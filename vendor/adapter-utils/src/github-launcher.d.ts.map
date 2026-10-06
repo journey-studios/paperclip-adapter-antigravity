@@ -1,0 +1,1 @@
+{"version":3,"file":"github-launcher.d.ts","sourceRoot":"","sources":["github-launcher.ts"],"names":[],"mappings":"AAAA,sGAAsG;AACtG,wBAAgB,oBAAoB,IAAI,MAAM,CAoG7C;AAED,0FAA0F;AAC1F,wBAAgB,uBAAuB,CAAC,KAAK,EAAE,MAAM,CAAC,MAAM,EAAE,OAAO,CAAC,EAAE,MAAM,EAAE;IAAE,GAAG,EAAE,MAAM,CAAC;IAAC,KAAK,EAAE,MAAM,CAAA;CAAE,GAAG,MAAM,CAAC,MAAM,EAAE,MAAM,CAAC,CAkBtI"}
