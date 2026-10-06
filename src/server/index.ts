@@ -39,6 +39,25 @@ export { getQuotaWindows, recordAgyRunUsage } from "./quota.js";
 function readUsageTotals(value: unknown): Record<string, number> | null {
   const obj = parseObject(value);
   if (Object.keys(obj).length === 0) return null;
+
+  const tokenKeys = [
+    "inputTokens",
+    "input_tokens",
+    "outputTokens",
+    "output_tokens",
+    "cachedInputTokens",
+    "cache_read_tokens",
+  ];
+  const hasRecognizedField = tokenKeys.some((key) =>
+    Object.prototype.hasOwnProperty.call(obj, key),
+  );
+  const hasInvalidRecognizedField = tokenKeys.some(
+    (key) =>
+      Object.prototype.hasOwnProperty.call(obj, key) &&
+      (typeof obj[key] !== "number" || !Number.isFinite(obj[key])),
+  );
+  if (!hasRecognizedField || hasInvalidRecognizedField) return null;
+
   return {
     inputTokens: asNumber(obj.inputTokens ?? obj.input_tokens, 0),
     outputTokens: asNumber(obj.outputTokens ?? obj.output_tokens, 0),
