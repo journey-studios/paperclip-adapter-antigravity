@@ -103,6 +103,55 @@ docker compose restart paperclip-app
 ```
 
 
+## Prerequisites
+
+Before using this adapter, ensure your host or Docker container meets the following requirements:
+
+1. **Antigravity CLI (`agy`) Installed**:
+   - `agy` must be installed and executable in `$PATH` (e.g. `/usr/local/bin/agy` or `~/.local/bin/agy`).
+   - If running inside Docker, bind-mount the `agy` binary:
+     ```yaml
+     volumes:
+       - /root/.local/bin/agy:/usr/local/bin/agy:ro
+       - /root/.gemini:/paperclip/.gemini:rw
+     ```
+2. **Google Antigravity Authentication**:
+   - Log in once on your host with:
+     ```bash
+     agy auth login
+     # or copy your existing ~/.gemini directory containing oauth credentials
+     ```
+   - Ensure the credentials directory (`~/.gemini`) is accessible to the user running Paperclip.
+
+---
+
+## Agent Configuration (UI)
+
+Once installed, configure any agent in Paperclip to use Antigravity:
+
+1. In Paperclip, go to **Company -> Agents -> [Select Agent] -> Runtime**.
+2. Select **Antigravity (agy)** (`agy_local`) as the runtime adapter.
+3. Configure the runtime parameters:
+   - **Model**: Default `gemini-3.8-flash-high`. Also supports `gemini-3.8-pro-high`, `claude-sonnet-4-6`, `claude-opus-4-6`, and `gpt-oss-120b`.
+   - **Skip Tool Permissions**: Enabled by default (`true`). Automatically passes `--dangerously-skip-permissions` so headless tasks don't get stuck waiting for user confirmation on file reads/writes.
+   - **Reasoning Effort**: `high` (default), `medium`, or `low`.
+   - **Execution Mode**: `accept-edits` (default) or `plan`.
+   - **Turn Timeout**: Default `24h` (supports `15m`, `1h`, etc.).
+   - **Project**: Optional Google Cloud / Antigravity project ID.
+   - **Extra CLI Arguments**: Any extra flags to pass to the CLI.
+
+---
+
+## Environment Variables
+
+You can customize the sliding window quota thresholds via environment variables in your Paperclip `.env` or Docker Compose file:
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGY_5H_TOKEN_LIMIT` | `2000000` | Baseline token limit for the 5-hour rolling quota window. |
+| `AGY_WEEKLY_TOKEN_LIMIT` | `15000000` | Baseline token limit for the 7-day rolling quota window. |
+| `PAPERCLIP_AGY_QUOTA_FILE` | `~/.gemini/antigravity-cli/quota-history.json` | Path to persistent quota history ledger. |
+
 ---
 
 ## Verification
@@ -113,6 +162,7 @@ docker compose restart paperclip-app
 4. Trigger an agent task. When the run finishes, check the **Costs** dashboard:
    - The token costs appear under **Month Spend**.
    - The Google subscription quota displays under **Subscription quota** with live **5h** and **Weekly** percentage progress bars.
+
 
 ---
 
