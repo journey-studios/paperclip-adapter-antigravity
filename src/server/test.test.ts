@@ -79,7 +79,7 @@ describe("agy-local testEnvironment", () => {
     };
   });
 
-  it("omits --mode when mode is unset (matching execute default mode) and probes with default stream-json input without --dangerously-skip-permissions", async () => {
+  it("omits --mode when mode is unset and keeps the documented default permission bypass", async () => {
     const ctx: AdapterEnvironmentTestContext = {
       companyId: "company-1",
       adapterType: "agy_local",
@@ -96,7 +96,7 @@ describe("agy-local testEnvironment", () => {
     expect(args[args.indexOf("--input-format") + 1]).toBe("stream-json");
     expect(args).not.toContain("--print");
     expect(args).not.toContain("--mode");
-    expect(args).not.toContain("--dangerously-skip-permissions");
+    expect(args).toContain("--dangerously-skip-permissions");
     expect(capturedRuns[0].options.stdin).toBe(
       JSON.stringify({ event: "user", message: { content: "Respond with hello." } }) + "\n",
     );
