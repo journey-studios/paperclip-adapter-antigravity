@@ -69,8 +69,9 @@ export async function recordAgyRunUsage(tokens: number, model?: string): Promise
 }
 
 /**
- * Return provider quota rate limits for Antigravity (5h and Weekly windows).
- * Evaluates the persistent sliding window ledger and returns ProviderQuotaResult.
+ * Return a local rolling-usage estimate for Antigravity (5h and Weekly windows).
+ * This is not the provider's authoritative subscription state: agy does not expose
+ * a quota API here, so reset timestamps must not be presented as provider resets.
  */
 export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
   try {
@@ -115,33 +116,27 @@ export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
     const used5hPercent = Math.min(100, Math.max(0, Math.round((tokens5h / limit5h) * 100)));
     const usedWeeklyPercent = Math.min(100, Math.max(0, Math.round((tokensWeekly / limitWeekly) * 100)));
 
-    const resets5h = oldest5hTimestamp
-      ? new Date(oldest5hTimestamp + FIVE_HOURS_MS).toISOString()
-      : new Date(now + FIVE_HOURS_MS).toISOString();
-    const resetsWeekly = oldestWeeklyTimestamp
-      ? new Date(oldestWeeklyTimestamp + SEVEN_DAYS_MS).toISOString()
-      : new Date(now + SEVEN_DAYS_MS).toISOString();
 
     const windows: QuotaWindow[] = [
       {
         label: "5h",
         usedPercent: used5hPercent,
-        resetsAt: resets5h,
-        valueLabel: `${Math.max(0, 100 - used5hPercent)}% remaining`,
-        detail: `${tokens5h.toLocaleString()} / ${limit5h.toLocaleString()} tokens (5h limit)`,
+        resetsAt: null,
+        valueLabel: `${Math.max(0, 100 - used5hPercent)}% remaining (local estimate)`,
+        detail: `${tokens5h.toLocaleString()} / ${limit5h.toLocaleString()} locally observed tokens in 5h; provider quota may differ`,
       },
       {
         label: "Weekly",
         usedPercent: usedWeeklyPercent,
-        resetsAt: resetsWeekly,
-        valueLabel: `${Math.max(0, 100 - usedWeeklyPercent)}% remaining`,
-        detail: `${tokensWeekly.toLocaleString()} / ${limitWeekly.toLocaleString()} tokens (7d limit)`,
+        resetsAt: null,
+        valueLabel: `${Math.max(0, 100 - usedWeeklyPercent)}% remaining (local estimate)`,
+        detail: `${tokensWeekly.toLocaleString()} / ${limitWeekly.toLocaleString()} locally observed tokens in 7d; provider quota may differ`,
       },
     ];
 
     return {
       provider: "google",
-      source: "antigravity",
+      source: "antigravity-local-estimate",
       ok: true,
       windows,
     };
