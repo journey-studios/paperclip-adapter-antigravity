@@ -421,7 +421,7 @@ export const AUTH_PATTERNS: RegExp[] = [
 ];
 
 export const QUOTA_PATTERNS: RegExp[] = [
-  /\bquota\s+(?:exceeded|exhausted)/i,
+  /\bquota\s+(?:reached|exceeded|exhausted)/i,
   /\brate\s?limit(?:ed|s)?\b/i,
   /resource[_\s]exhausted/i,
   /too\s+many\s+requests/i,
