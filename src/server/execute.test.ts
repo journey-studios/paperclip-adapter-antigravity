@@ -654,20 +654,34 @@ describe("agy-local execute run outcome", () => {
     const lastCallOptions = calls[calls.length - 1][3] as { stdin?: string };
     expect(lastCallOptions?.stdin).toBeUndefined();
   });
-  it("suppresses a stale quota error from a resumed conversation that already produced a terminal response", async () => {
+  it("suppresses the historical quota error shape from a completed resumed turn", async () => {
     vi.mocked(runChildProcess).mockClear();
+    const quotaMessage =
+      "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h39m17s.";
     const stdout = [
       '{"event":"init","conversation_id":"conv-stale"}',
-      '{"event":"result","result":{"conversation_id":"conv-stale","status":"ERROR","response":"DELIVERED","error":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h39m17s.","usage":{"input_tokens":150,"output_tokens":20,"cache_read_tokens":70}}}',
+      '{"event":"step_update","step_update":{"conversation_id":"conv-stale","step_index":399,"state":"ACTIVE","step_type":"agent_response","text_delta":"DELIV"}}',
+      '{"event":"step_update","step_update":{"conversation_id":"conv-stale","step_index":399,"state":"DONE","step_type":"agent_response","text_delta":"ERED","usage":{"input_tokens":150,"output_tokens":20,"cache_read_tokens":70}}}',
+      JSON.stringify({
+        event: "result",
+        result: {
+          conversation_id: "conv-stale",
+          status: "ERROR",
+          response: "DELIVERED",
+          error: quotaMessage,
+          usage: { input_tokens: 150, output_tokens: 20, cache_read_tokens: 70 },
+        },
+      }),
     ].join("\n");
     vi.mocked(runChildProcess).mockResolvedValueOnce({
-      exitCode: 1,
+      exitCode: 0,
       signal: null,
       timedOut: false,
       stdout,
       stderr: "",
     } as Awaited<ReturnType<typeof runChildProcess>>);
 
+    const logs: string[] = [];
     const result = await execute({
       runId: "run-stale-quota",
       agent: {
@@ -689,7 +703,7 @@ describe("agy-local execute run outcome", () => {
       },
       config: {},
       context: { paperclipWorkspace: { cwd: "/tmp/workspace" } },
-      onLog: async () => {},
+      onLog: async (_stream, chunk) => logs.push(chunk),
     });
 
     expect(result.exitCode).toBe(0);
@@ -702,8 +716,90 @@ describe("agy-local execute run outcome", () => {
       outputTokens: 10,
       cachedInputTokens: 20,
     });
-    expect((result.resultJson as Record<string, unknown>).stale_quota_error_suppressed).toBe(true);
+    expect(result.resultJson).toEqual(
+      expect.objectContaining({
+        stale_quota_error_suppressed: true,
+        historical_quota_error: quotaMessage,
+      }),
+    );
+    expect(logs.join("")).toMatch(/historical quota error/);
     expect(vi.mocked(runChildProcess)).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not suppress genuine current-turn quota exhaustion on resume", async () => {
+    vi.mocked(runChildProcess).mockClear();
+    const quotaMessage =
+      "API error: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h38m3s.";
+    const stdout = [
+      '{"event":"init","conversation_id":"conv-real-quota"}',
+      JSON.stringify({
+        event: "step_update",
+        step_update: {
+          conversation_id: "conv-real-quota",
+          step_index: 2,
+          state: "ERROR",
+          step_type: "error_message",
+          text_delta: quotaMessage,
+        },
+      }),
+      JSON.stringify({
+        event: "result",
+        result: {
+          conversation_id: "conv-real-quota",
+          status: "ERROR",
+          response: "",
+          error: quotaMessage,
+          usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 },
+        },
+      }),
+    ].join("\n");
+
+    // First resumed attempt reports the real quota. The adapter safely retries
+    // once because no tool activity occurred; the fresh attempt confirms it.
+    vi.mocked(runChildProcess)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout,
+        stderr: "",
+      } as Awaited<ReturnType<typeof runChildProcess>>)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout,
+        stderr: "",
+      } as Awaited<ReturnType<typeof runChildProcess>>);
+
+    const result = await execute({
+      runId: "run-real-quota",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Test Agent",
+        adapterType: "agy_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "conv-real-quota",
+        sessionParams: { sessionId: "conv-real-quota", cwd: "/tmp/workspace" },
+        sessionDisplayId: "conv-real-quota",
+        taskKey: "issue-1",
+      },
+      config: {},
+      context: { paperclipWorkspace: { cwd: "/tmp/workspace" } },
+      onLog: async () => {},
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("agy_quota_exhausted");
+    expect(result.errorFamily).toBe("provider_quota");
+    expect(result.errorMessage).toContain("RESOURCE_EXHAUSTED");
+    expect(result.resultJson).not.toEqual(
+      expect.objectContaining({ stale_quota_error_suppressed: true }),
+    );
+    expect(vi.mocked(runChildProcess)).toHaveBeenCalledTimes(2);
   });
 
   it("returns only the usage delta for a resumed conversation with a persisted baseline", async () => {
