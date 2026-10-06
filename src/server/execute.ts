@@ -99,6 +99,25 @@ export function isHistoricalQuotaResumeResult(input: {
 function readUsageSnapshot(value: unknown): UsageSummary | null {
   const obj = parseObject(value);
   if (Object.keys(obj).length === 0) return null;
+
+  const tokenKeys = [
+    "inputTokens",
+    "input_tokens",
+    "outputTokens",
+    "output_tokens",
+    "cachedInputTokens",
+    "cache_read_tokens",
+  ];
+  const hasRecognizedField = tokenKeys.some((key) =>
+    Object.prototype.hasOwnProperty.call(obj, key),
+  );
+  const hasInvalidRecognizedField = tokenKeys.some(
+    (key) =>
+      Object.prototype.hasOwnProperty.call(obj, key) &&
+      (typeof obj[key] !== "number" || !Number.isFinite(obj[key])),
+  );
+  if (!hasRecognizedField || hasInvalidRecognizedField) return null;
+
   return {
     inputTokens: asNumber(obj.inputTokens ?? obj.input_tokens, 0),
     outputTokens: asNumber(obj.outputTokens ?? obj.output_tokens, 0),
@@ -758,7 +777,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: initial.proc.exitCode,
       stderr: initial.proc.stderr,
     });
-    const hasCompletedToolActivity = initial.parsed.tools.some((tool) => tool.completed);
+    const hasToolActivity = initial.parsed.tools.length > 0;
 
     if (historicalQuotaError) {
       await onLog(
@@ -773,7 +792,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(finalResult.resultJson as Record<string, unknown> | undefined),
         historical_quota_error: initial.parsed.errorMessage,
       };
-    } else if (!hasCompletedToolActivity) {
+    } else if (!hasToolActivity) {
       await onLog(
         "stdout",
         "[paperclip] Resumed Antigravity conversation reported quota before doing work; retrying once with a fresh conversation.\n",
