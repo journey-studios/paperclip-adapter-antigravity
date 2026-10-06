@@ -782,19 +782,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (finalAttemptResumed) {
       if (previousUsage) {
         normalizedUsage = deriveUsageDelta(finalResult.usage, previousUsage);
-      } else {
+      } else if (finalResult.sessionId) {
         // Older persisted sessions do not have a usage baseline. Let Paperclip
         // derive the delta from the previous run instead of double-counting the
         // conversation total. The next heartbeat will have a local baseline.
         usageBasis = "session_cumulative";
         shouldRecordLocalQuota = false;
+      } else {
+        // A poisoned legacy session is being cleared and Paperclip can no longer
+        // associate cumulative usage with that session to derive a delta safely.
+        // Prefer one unmetered run over knowingly double-counting the whole session.
+        finalResult.usage = undefined;
+        finalResult.usageBasis = undefined;
+        finalResult.costUsd = null;
+        shouldRecordLocalQuota = false;
+        finalResult.resultJson = {
+          ...(finalResult.resultJson as Record<string, unknown> | undefined),
+          usage_omitted_for_cleared_legacy_session: true,
+        };
       }
     }
 
-    finalResult.usage = normalizedUsage;
-    finalResult.usageBasis = usageBasis;
-    finalResult.costUsd =
-      usageBasis === "per_run" ? estimateAgyModelCostUsd(model, normalizedUsage) : null;
+    if (finalResult.usage) {
+      finalResult.usage = normalizedUsage;
+      finalResult.usageBasis = usageBasis;
+      finalResult.costUsd =
+        usageBasis === "per_run" ? estimateAgyModelCostUsd(model, normalizedUsage) : null;
+    }
 
     if (finalResult.sessionParams) {
       finalResult.sessionParams = {
