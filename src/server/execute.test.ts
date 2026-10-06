@@ -802,6 +802,129 @@ describe("agy-local execute run outcome", () => {
     expect(vi.mocked(runChildProcess)).toHaveBeenCalledTimes(2);
   });
 
+  it("does not fresh-retry quota after a tool has started but not completed", async () => {
+    vi.mocked(runChildProcess).mockClear();
+    const quotaMessage =
+      "API error: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h38m3s.";
+    const stdout = [
+      '{"event":"init","conversation_id":"conv-started-tool"}',
+      JSON.stringify({
+        event: "step_update",
+        step_update: {
+          conversation_id: "conv-started-tool",
+          step_index: 2,
+          state: "ACTIVE",
+          step_type: "tool",
+          tool_name: "write_to_file",
+          tool_info: {
+            name: "write_to_file",
+            parameters: { TargetFile: "/tmp/workspace/output.txt" },
+          },
+        },
+      }),
+      JSON.stringify({
+        event: "step_update",
+        step_update: {
+          conversation_id: "conv-started-tool",
+          step_index: 3,
+          state: "ERROR",
+          step_type: "error_message",
+          text_delta: quotaMessage,
+        },
+      }),
+      JSON.stringify({
+        event: "result",
+        result: {
+          conversation_id: "conv-started-tool",
+          status: "ERROR",
+          response: "",
+          error: quotaMessage,
+          usage: { input_tokens: 50, output_tokens: 0, cache_read_tokens: 10 },
+        },
+      }),
+    ].join("\n");
+
+    vi.mocked(runChildProcess).mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout,
+      stderr: "",
+    } as Awaited<ReturnType<typeof runChildProcess>>);
+
+    const result = await execute({
+      runId: "run-started-tool-quota",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Test Agent",
+        adapterType: "agy_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "conv-started-tool",
+        sessionParams: { sessionId: "conv-started-tool", cwd: "/tmp/workspace" },
+        sessionDisplayId: "conv-started-tool",
+        taskKey: "issue-1",
+      },
+      config: {},
+      context: { paperclipWorkspace: { cwd: "/tmp/workspace" } },
+      onLog: async () => {},
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("agy_quota_exhausted");
+    expect(result.clearSession).toBe(true);
+    expect(vi.mocked(runChildProcess)).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an invalid runtime usage baseline instead of deriving a per-run delta", async () => {
+    vi.mocked(runChildProcess).mockClear();
+    const stdout = [
+      '{"event":"init","conversation_id":"conv-invalid-baseline"}',
+      '{"event":"result","result":{"conversation_id":"conv-invalid-baseline","status":"SUCCESS","response":"OK","usage":{"input_tokens":450,"output_tokens":60,"cache_read_tokens":210}}}',
+    ].join("\n");
+    vi.mocked(runChildProcess).mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout,
+      stderr: "",
+    } as Awaited<ReturnType<typeof runChildProcess>>);
+
+    const result = await execute({
+      runId: "run-invalid-baseline",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Test Agent",
+        adapterType: "agy_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "conv-invalid-baseline",
+        sessionParams: {
+          sessionId: "conv-invalid-baseline",
+          cwd: "/tmp/workspace",
+          usageTotals: { inputTokens: "not-a-number" },
+        } as any,
+        sessionDisplayId: "conv-invalid-baseline",
+        taskKey: "issue-1",
+      },
+      config: {},
+      context: { paperclipWorkspace: { cwd: "/tmp/workspace" } },
+      onLog: async () => {},
+    });
+
+    expect(result.usageBasis).toBe("session_cumulative");
+    expect(result.usage).toEqual({
+      inputTokens: 450,
+      outputTokens: 60,
+      cachedInputTokens: 210,
+    });
+    expect(result.costUsd).toBeNull();
+  });
+
   it("returns only the usage delta for a resumed conversation with a persisted baseline", async () => {
     vi.mocked(runChildProcess).mockClear();
     const stdout = [
