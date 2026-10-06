@@ -19,7 +19,7 @@ Designed as an **isolated, upgrade-safe external plugin**: installs cleanly into
   - Claude Sonnet: \$3.00 / 1M input, \$15.00 / 1M output
   - Claude Opus: \$15.00 / 1M input, \$75.00 / 1M output
   - GPT-OSS 120B: \$0.20 / 1M input, \$0.60 / 1M output
-- **ACP Subscription Quota Tracker**: Implements `getQuotaWindows()` with 5-hour and 7-day sliding windows, rendering live quota bars (`5h` and `Weekly`) in Paperclip's native **Costs -> Subscription Quota** card.
+- **Provider Subscription Quota**: Reads the authoritative Antigravity `/usage` command, including model-family 5-hour/weekly buckets and provider reset times. Falls back to a clearly labeled local estimate only when `/usage` is unavailable.
 - **Session Continuity**: Multi-turn conversation state persistence across heartbeats via `--conversation <id>` with automatic recovery.
 - **Live UI Parser**: Bundles a self-contained CommonJS log parser (`ui-parser.cjs`) served dynamically by Paperclip to render live streaming thought processes and tool calls in the UI.
 
@@ -144,13 +144,16 @@ Once installed, configure any agent in Paperclip to use Antigravity:
 
 ## Environment Variables
 
-You can customize the sliding window quota thresholds via environment variables in your Paperclip `.env` or Docker Compose file:
+Provider quota comes from Antigravity `/usage`. The local fallback and probe behavior can be customized via environment variables in your Paperclip `.env` or Docker Compose file:
 
 | Variable | Default | Description |
 |---|---|---|
-| `AGY_5H_TOKEN_LIMIT` | `2000000` | Baseline token limit for the 5-hour rolling quota window. |
-| `AGY_WEEKLY_TOKEN_LIMIT` | `15000000` | Baseline token limit for the 7-day rolling quota window. |
-| `PAPERCLIP_AGY_QUOTA_FILE` | `~/.gemini/antigravity-cli/quota-history.json` | Path to persistent quota history ledger. |
+| `AGY_5H_TOKEN_LIMIT` | `2000000` | Fallback-only token limit when provider `/usage` is unavailable. |
+| `AGY_WEEKLY_TOKEN_LIMIT` | `15000000` | Fallback-only weekly limit when provider `/usage` is unavailable. |
+| `PAPERCLIP_AGY_QUOTA_FILE` | `~/.gemini/antigravity-cli/quota-history.json` | Path to the local fallback usage ledger. |
+| `PAPERCLIP_AGY_QUOTA_CACHE_MS` | `60000` | Cache duration for provider `/usage` results. |
+| `PAPERCLIP_AGY_QUOTA_TIMEOUT_MS` | `10000` | Timeout for the provider quota probe. |
+| `PAPERCLIP_AGY_COMMAND` | `agy` | Optional command/path override used by the quota probe. |
 
 ---
 

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionContext, AdapterExecutionResult, UsageSummary } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -40,6 +40,7 @@ import {
 import {
   describeAgyDeniedActions,
   detectAgyAuthRequired,
+  estimateAgyModelCostUsd,
   detectAgyQuotaExhausted,
   isAgySessionUnrecoverableError,
   isAgyTransientNetworkError,
@@ -68,6 +69,73 @@ function firstNonEmptyLine(text: string): string {
       .map((line) => line.trim())
       .find(Boolean) ?? ""
   );
+}
+
+/**
+ * Work around google-antigravity/antigravity-cli#1048.
+ *
+ * On resume, agy can finish the current turn successfully and then attach a
+ * quota error copied from an older turn to the terminal result. A genuine
+ * current-turn quota failure emits an error_message step and does not complete
+ * an assistant response. Keep the guard deliberately strict so real 429s are
+ * never converted into success.
+ */
+export function isHistoricalQuotaResumeResult(input: {
+  resumedSession: boolean;
+  parsed: ParsedAgyOutput;
+  exitCode: number | null;
+  stderr: string;
+}): boolean {
+  if (!input.resumedSession || (input.exitCode ?? 0) !== 0 || input.stderr.trim()) return false;
+  if (!input.parsed.completedAssistantResponse || input.parsed.sawErrorStep) return false;
+
+  const response = (input.parsed.response ?? "").trim();
+  const streamed = input.parsed.assistantText.trim();
+  if (!response || !streamed || response !== streamed) return false;
+
+  return detectAgyQuotaExhausted({ parsed: input.parsed });
+}
+
+function readUsageSnapshot(value: unknown): UsageSummary | null {
+  const obj = parseObject(value);
+  if (Object.keys(obj).length === 0) return null;
+
+  const tokenKeys = [
+    "inputTokens",
+    "input_tokens",
+    "outputTokens",
+    "output_tokens",
+    "cachedInputTokens",
+    "cache_read_tokens",
+  ];
+  const hasRecognizedField = tokenKeys.some((key) =>
+    Object.prototype.hasOwnProperty.call(obj, key),
+  );
+  const hasInvalidRecognizedField = tokenKeys.some(
+    (key) =>
+      Object.prototype.hasOwnProperty.call(obj, key) &&
+      (typeof obj[key] !== "number" || !Number.isFinite(obj[key])),
+  );
+  if (!hasRecognizedField || hasInvalidRecognizedField) return null;
+
+  return {
+    inputTokens: asNumber(obj.inputTokens ?? obj.input_tokens, 0),
+    outputTokens: asNumber(obj.outputTokens ?? obj.output_tokens, 0),
+    cachedInputTokens: asNumber(obj.cachedInputTokens ?? obj.cache_read_tokens, 0),
+  };
+}
+
+function deriveUsageDelta(current: UsageSummary, previous: UsageSummary): UsageSummary {
+  const delta = (now: number | undefined, before: number | undefined) => {
+    const currentValue = now ?? 0;
+    const previousValue = before ?? 0;
+    return currentValue >= previousValue ? currentValue - previousValue : currentValue;
+  };
+  return {
+    inputTokens: delta(current.inputTokens, previous.inputTokens),
+    outputTokens: delta(current.outputTokens, previous.outputTokens),
+    cachedInputTokens: delta(current.cachedInputTokens, previous.cachedInputTokens),
+  };
 }
 
 /**
@@ -521,9 +589,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   type Attempt = Awaited<ReturnType<typeof runAttempt>>;
 
+  type ResultOptions = {
+    clearSessionOnMissingSession?: boolean;
+    suppressQuotaFailure?: boolean;
+    forceClearSession?: boolean;
+  };
+
   const toResult = (
     attempt: Attempt,
-    clearSessionOnMissingSession = false,
+    options: ResultOptions = {},
   ): AdapterExecutionResult => {
     const requiresAuth = detectAgyAuthRequired({
       stdout: attempt.proc.stdout,
@@ -535,12 +609,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stderr: attempt.proc.stderr,
       parsed: attempt.parsed,
     });
+    const suppressQuotaFailure = Boolean(options.suppressQuotaFailure && quotaExhausted);
     const networkUnavailable = isAgyTransientNetworkError(
       attempt.proc.stdout,
       attempt.proc.stderr,
     );
 
     const classifyErrorCode = (): string | null => {
+      if (suppressQuotaFailure) return null;
       if (attempt.proc.errorCode) return attempt.proc.errorCode;
       if (requiresAuth) return "agy_auth_required";
       if (quotaExhausted) return "agy_quota_exhausted";
@@ -548,11 +624,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return null;
     };
 
-    const errorFamily = quotaExhausted
-      ? ("provider_quota" as const)
-      : networkUnavailable
-        ? ("transient_upstream" as const)
-        : null;
+    const errorFamily = suppressQuotaFailure
+      ? null
+      : quotaExhausted
+        ? ("provider_quota" as const)
+        : networkUnavailable
+          ? ("transient_upstream" as const)
+          : null;
 
     if (attempt.proc.timedOut) {
       return {
@@ -562,13 +640,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: classifyErrorCode(),
         errorFamily,
-        clearSession: clearSessionOnMissingSession,
+        clearSession: Boolean(options.forceClearSession || options.clearSessionOnMissingSession),
       };
     }
 
-    const resolvedSessionId =
-      attempt.parsed.sessionId ??
-      (clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
+    const resolvedSessionId = options.forceClearSession
+      ? null
+      : attempt.parsed.sessionId ??
+        (options.clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
     const resolvedSessionParams = resolvedSessionId
       ? ({
           sessionId: resolvedSessionId,
@@ -585,11 +664,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         } as Record<string, unknown>)
       : null;
 
-    const outcome = resolveAgyRunOutcome(attempt.parsed, attempt.proc.exitCode);
+    const outcome = suppressQuotaFailure
+      ? { failed: false, errorMessage: null, permissionDenied: false }
+      : resolveAgyRunOutcome(attempt.parsed, attempt.proc.exitCode);
     const outcomeError = outcome.errorMessage?.trim() ?? "";
     const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
     const rawExitCode = attempt.proc.exitCode;
-    const synthesizedExitCode = outcome.failed && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+    const synthesizedExitCode = suppressQuotaFailure
+      ? 0
+      : outcome.failed && (rawExitCode ?? 0) === 0
+        ? 1
+        : rawExitCode;
     const fallbackErrorMessage =
       outcomeError || stderrLine || `Antigravity exited with code ${synthesizedExitCode ?? -1}`;
     const failed = outcome.failed;
@@ -598,7 +683,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     return {
       exitCode: synthesizedExitCode,
-      signal: attempt.proc.signal,
+      signal: suppressQuotaFailure ? null : attempt.proc.signal,
       timedOut: false,
       errorMessage: failed ? fallbackErrorMessage : null,
       errorCode: failed
@@ -636,18 +721,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(attempt.parsed.malformedLines > 0
           ? { malformed_stream_lines: attempt.parsed.malformedLines }
           : {}),
+        ...(suppressQuotaFailure ? { stale_quota_error_suppressed: true } : {}),
       },
       summary: attempt.parsed.summary || (failed ? fallbackErrorMessage : null),
-      clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
+      clearSession: Boolean(
+        options.forceClearSession ||
+          (options.clearSessionOnMissingSession && !attempt.parsed.sessionId),
+      ),
     };
   };
 
   const initial = await runAttempt(sessionId);
-  const initialFailed =
-    !initial.proc.timedOut && resolveAgyRunOutcome(initial.parsed, initial.proc.exitCode).failed;
+  const initialOutcome = resolveAgyRunOutcome(initial.parsed, initial.proc.exitCode);
+  const initialFailed = !initial.proc.timedOut && initialOutcome.failed;
+  const initialQuotaExhausted = detectAgyQuotaExhausted({
+    stdout: initial.proc.stdout,
+    stderr: initial.proc.stderr,
+    parsed: initial.parsed,
+  });
 
   let finalAttempt: Attempt = initial;
+  let finalAttemptResumed = Boolean(sessionId);
   let finalResult: AdapterExecutionResult;
+
   if (
     sessionId &&
     initialFailed &&
@@ -664,13 +760,127 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
     const retry = await runAttempt(null);
     finalAttempt = retry;
-    finalResult = toResult(retry, true);
+    finalAttemptResumed = false;
+    const retryQuotaExhausted = detectAgyQuotaExhausted({
+      stdout: retry.proc.stdout,
+      stderr: retry.proc.stderr,
+      parsed: retry.parsed,
+    });
+    finalResult = toResult(retry, {
+      clearSessionOnMissingSession: true,
+      forceClearSession: retryQuotaExhausted,
+    });
+  } else if (sessionId && initialFailed && initialQuotaExhausted) {
+    const historicalQuotaError = isHistoricalQuotaResumeResult({
+      resumedSession: true,
+      parsed: initial.parsed,
+      exitCode: initial.proc.exitCode,
+      stderr: initial.proc.stderr,
+    });
+    const hasToolActivity = initial.parsed.tools.length > 0;
+
+    if (historicalQuotaError) {
+      await onLog(
+        "stdout",
+        "[paperclip] Ignored a historical quota error attached to a completed resumed Antigravity turn; clearing the poisoned conversation before the next run (google-antigravity/antigravity-cli#1048).\n",
+      );
+      finalResult = toResult(initial, {
+        suppressQuotaFailure: true,
+        forceClearSession: true,
+      });
+      finalResult.resultJson = {
+        ...(finalResult.resultJson as Record<string, unknown> | undefined),
+        historical_quota_error: initial.parsed.errorMessage,
+      };
+    } else if (!hasToolActivity) {
+      await onLog(
+        "stdout",
+        "[paperclip] Resumed Antigravity conversation reported quota before doing work; retrying once with a fresh conversation.\n",
+      );
+      const retry = await runAttempt(null);
+      finalAttempt = retry;
+      finalAttemptResumed = false;
+      const retryQuotaExhausted = detectAgyQuotaExhausted({
+        stdout: retry.proc.stdout,
+        stderr: retry.proc.stderr,
+        parsed: retry.parsed,
+      });
+      finalResult = toResult(retry, {
+        forceClearSession: retryQuotaExhausted,
+      });
+    } else {
+      await onLog(
+        "stdout",
+        "[paperclip] Resumed Antigravity conversation hit quota after tool activity; not replaying potentially mutating work. The conversation will be cleared for the next run.\n",
+      );
+      finalResult = toResult(initial, { forceClearSession: true });
+    }
   } else {
     finalResult = toResult(initial);
   }
 
   if (finalAttempt.parsed.deniedActions.length > 0) {
     await onLog("stdout", `[paperclip] ${describeAgyDeniedActions(finalAttempt.parsed.deniedActions)}\n`);
+  }
+
+  const rawUsage = finalAttempt.parsed.usage;
+  if (rawUsage && finalResult.usage) {
+    const previousUsage = readUsageSnapshot(
+      runtimeSessionParams.usageTotals ?? runtimeSessionParams.usage_totals,
+    );
+    let normalizedUsage = finalResult.usage;
+    let usageBasis: "per_run" | "session_cumulative" = "per_run";
+    let shouldRecordLocalQuota = true;
+
+    if (finalAttemptResumed) {
+      if (previousUsage) {
+        normalizedUsage = deriveUsageDelta(finalResult.usage, previousUsage);
+      } else if (finalResult.sessionId) {
+        // Older persisted sessions do not have a usage baseline. Let Paperclip
+        // derive the delta from the previous run instead of double-counting the
+        // conversation total. The next heartbeat will have a local baseline.
+        usageBasis = "session_cumulative";
+        shouldRecordLocalQuota = false;
+      } else {
+        // A poisoned legacy session is being cleared and Paperclip can no longer
+        // associate cumulative usage with that session to derive a delta safely.
+        // Prefer one unmetered run over knowingly double-counting the whole session.
+        finalResult.usage = undefined;
+        finalResult.usageBasis = undefined;
+        finalResult.costUsd = null;
+        shouldRecordLocalQuota = false;
+        finalResult.resultJson = {
+          ...(finalResult.resultJson as Record<string, unknown> | undefined),
+          usage_omitted_for_cleared_legacy_session: true,
+        };
+      }
+    }
+
+    if (finalResult.usage) {
+      finalResult.usage = normalizedUsage;
+      finalResult.usageBasis = usageBasis;
+      finalResult.costUsd =
+        usageBasis === "per_run" ? estimateAgyModelCostUsd(model, normalizedUsage) : null;
+    }
+
+    if (finalResult.sessionParams) {
+      finalResult.sessionParams = {
+        ...(finalResult.sessionParams as Record<string, unknown>),
+        usageTotals: {
+          inputTokens: rawUsage.inputTokens ?? 0,
+          outputTokens: rawUsage.outputTokens ?? 0,
+          cachedInputTokens: rawUsage.cachedInputTokens ?? 0,
+        },
+      };
+    }
+
+    if (shouldRecordLocalQuota) {
+      const totalTokens =
+        (normalizedUsage.inputTokens || 0) + (normalizedUsage.outputTokens || 0);
+      if (totalTokens > 0) {
+        await recordAgyRunUsage(totalTokens, model).catch(() => {});
+      }
+    }
   }
 
   if (finalResult.sessionId && !executionTargetIsRemote) {
@@ -684,13 +894,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(finalResult.resultJson as Record<string, unknown> | undefined),
         artifacts,
       };
-    }
-  }
-
-  if (finalResult.usage) {
-    const totalTokens = (finalResult.usage.inputTokens || 0) + (finalResult.usage.outputTokens || 0);
-    if (totalTokens > 0) {
-      await recordAgyRunUsage(totalTokens, model).catch(() => {});
     }
   }
 
