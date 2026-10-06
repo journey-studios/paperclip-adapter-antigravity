@@ -71,6 +71,31 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
+/**
+ * Work around google-antigravity/antigravity-cli#1048.
+ *
+ * On resume, agy can finish the current turn successfully and then attach a
+ * quota error copied from an older turn to the terminal result. A genuine
+ * current-turn quota failure emits an error_message step and does not complete
+ * an assistant response. Keep the guard deliberately strict so real 429s are
+ * never converted into success.
+ */
+export function isHistoricalQuotaResumeResult(input: {
+  resumedSession: boolean;
+  parsed: ParsedAgyOutput;
+  exitCode: number | null;
+  stderr: string;
+}): boolean {
+  if (!input.resumedSession || (input.exitCode ?? 0) !== 0 || input.stderr.trim()) return false;
+  if (!input.parsed.completedAssistantResponse || input.parsed.sawErrorStep) return false;
+
+  const response = (input.parsed.response ?? "").trim();
+  const streamed = input.parsed.assistantText.trim();
+  if (!response || !streamed || response !== streamed) return false;
+
+  return detectAgyQuotaExhausted({ parsed: input.parsed });
+}
+
 function readUsageSnapshot(value: unknown): UsageSummary | null {
   const obj = parseObject(value);
   if (Object.keys(obj).length === 0) return null;
@@ -727,18 +752,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       forceClearSession: retryQuotaExhausted,
     });
   } else if (sessionId && initialFailed && initialQuotaExhausted) {
-    const hasTerminalResponse = Boolean((initial.parsed.response ?? "").trim());
+    const historicalQuotaError = isHistoricalQuotaResumeResult({
+      resumedSession: true,
+      parsed: initial.parsed,
+      exitCode: initial.proc.exitCode,
+      stderr: initial.proc.stderr,
+    });
     const hasCompletedToolActivity = initial.parsed.tools.some((tool) => tool.completed);
 
-    if (hasTerminalResponse) {
+    if (historicalQuotaError) {
       await onLog(
         "stdout",
-        "[paperclip] Ignoring a stale quota error returned by a resumed Antigravity conversation after it produced a terminal response; the poisoned conversation will be cleared.\n",
+        "[paperclip] Ignored a historical quota error attached to a completed resumed Antigravity turn; clearing the poisoned conversation before the next run (google-antigravity/antigravity-cli#1048).\n",
       );
       finalResult = toResult(initial, {
         suppressQuotaFailure: true,
         forceClearSession: true,
       });
+      finalResult.resultJson = {
+        ...(finalResult.resultJson as Record<string, unknown> | undefined),
+        historical_quota_error: initial.parsed.errorMessage,
+      };
     } else if (!hasCompletedToolActivity) {
       await onLog(
         "stdout",
