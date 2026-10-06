@@ -1,5 +1,5 @@
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
-import { asString, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import { asNumber, asString, parseObject } from "@paperclipai/adapter-utils/server-utils";
 
 export { execute, modelHasEffortSuffix, resolveAgyPrintTimeoutSec } from "./execute.js";
 export { testEnvironment } from "./test.js";
@@ -35,6 +35,16 @@ export {
   type AgyCredentialReadinessInput,
 } from "./credentials.js";
 export { getQuotaWindows, recordAgyRunUsage } from "./quota.js";
+
+function readUsageTotals(value: unknown): Record<string, number> | null {
+  const obj = parseObject(value);
+  if (Object.keys(obj).length === 0) return null;
+  return {
+    inputTokens: asNumber(obj.inputTokens ?? obj.input_tokens, 0),
+    outputTokens: asNumber(obj.outputTokens ?? obj.output_tokens, 0),
+    cachedInputTokens: asNumber(obj.cachedInputTokens ?? obj.cache_read_tokens, 0),
+  };
+}
 export { getConfigSchema } from "./config-schema.js";
 
 export const sessionCodec: AdapterSessionCodec = {
@@ -58,6 +68,7 @@ export const sessionCodec: AdapterSessionCodec = {
       typeof obj.remoteExecution === "object" && obj.remoteExecution !== null && !Array.isArray(obj.remoteExecution)
         ? { ...(obj.remoteExecution as Record<string, unknown>) }
         : null;
+    const usageTotals = readUsageTotals(obj.usageTotals ?? obj.usage_totals);
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
@@ -65,6 +76,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
       ...(remoteExecution ? { remoteExecution } : {}),
+      ...(usageTotals ? { usageTotals } : {}),
     };
   },
   serialize(params) {
@@ -85,6 +97,7 @@ export const sessionCodec: AdapterSessionCodec = {
       !Array.isArray(params.remoteExecution)
         ? { ...(params.remoteExecution as Record<string, unknown>) }
         : null;
+    const usageTotals = readUsageTotals(params.usageTotals ?? params.usage_totals);
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
@@ -92,6 +105,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
       ...(remoteExecution ? { remoteExecution } : {}),
+      ...(usageTotals ? { usageTotals } : {}),
     };
   },
   getDisplayId(params) {
