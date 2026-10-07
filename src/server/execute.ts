@@ -156,19 +156,20 @@ export function resolveAgyPrintTimeoutSec(timeoutSec: number): number {
   return Math.max(30, timeoutSec - margin);
 }
 
-export function buildAgyMcpConfig(servers: AdapterRuntimeMcpServer[]): {
-  mcpServers: Record<string, {
-    disabled: false;
-    headers: { Authorization: string };
-    serverUrl: string;
-  }>;
-} {
-  const mcpServers: Record<string, {
-    disabled: false;
-    headers: { Authorization: string };
-    serverUrl: string;
-  }> = {};
-  const usedNames = new Set<string>();
+function recordOrEmpty(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+export function buildAgyMcpConfig(
+  servers: AdapterRuntimeMcpServer[],
+  existingConfig: unknown = {},
+): Record<string, unknown> {
+  const existing = recordOrEmpty(existingConfig);
+  const existingServers = recordOrEmpty(existing.mcpServers);
+  const mcpServers: Record<string, unknown> = { ...existingServers };
+  const usedNames = new Set<string>(Object.keys(existingServers));
 
   for (const server of servers) {
     const baseName = server.name.trim() || server.connectionId.trim() || "paperclip";
@@ -186,7 +187,21 @@ export function buildAgyMcpConfig(servers: AdapterRuntimeMcpServer[]): {
     };
   }
 
-  return { mcpServers };
+  return { ...existing, mcpServers };
+}
+
+async function readAgyMcpConfig(filePath: string): Promise<Record<string, unknown>> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`Antigravity MCP config at ${filePath} must be a JSON object.`);
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
 }
 
 async function symlinkEntries(
@@ -215,23 +230,31 @@ async function prepareAgyRuntimeMcpHome(input: {
   await fs.chmod(homeDir, 0o700);
 
   try {
-    await symlinkEntries(input.sourceHome, homeDir, new Set([".gemini"]));
-
     const sourceGemini = path.join(input.sourceHome, ".gemini");
+    const sourceAntigravityCli = path.join(sourceGemini, "antigravity-cli");
+    const sourceConfig = path.join(sourceGemini, "config");
+    const sourceMcpConfig = path.join(sourceConfig, "mcp_config.json");
     const targetGemini = path.join(homeDir, ".gemini");
     const targetConfig = path.join(targetGemini, "config");
+
+    // Ensure CLI state created during this attempt (sessions, brain artifacts,
+    // logs, etc.) lands in the persistent HOME even on a first Antigravity run.
+    await fs.mkdir(sourceAntigravityCli, { recursive: true });
+
+    await symlinkEntries(input.sourceHome, homeDir, new Set([".gemini"]));
     await fs.mkdir(targetConfig, { recursive: true });
 
     await symlinkEntries(sourceGemini, targetGemini, new Set(["config"]));
     await symlinkEntries(
-      path.join(sourceGemini, "config"),
+      sourceConfig,
       targetConfig,
       new Set(["mcp_config.json"]),
     );
 
+    const existingMcpConfig = await readAgyMcpConfig(sourceMcpConfig);
     await fs.writeFile(
       path.join(targetConfig, "mcp_config.json"),
-      `${JSON.stringify(buildAgyMcpConfig(input.servers), null, 2)}\n`,
+      `${JSON.stringify(buildAgyMcpConfig(input.servers, existingMcpConfig), null, 2)}\n`,
       { encoding: "utf8", mode: 0o600 },
     );
 
@@ -650,13 +673,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       attemptRuntimeEnv = { ...runtimeEnv, HOME: isolatedHome.homeDir };
       cleanupRuntimeMcpHome = isolatedHome.cleanup;
-      await onLog(
-        "stdout",
-        `[paperclip] Injected ${runtimeMcpServers.length} run-scoped MCP server(s) into Antigravity.\n`,
-      );
     }
 
     try {
+      if (cleanupRuntimeMcpHome) {
+        await onLog(
+          "stdout",
+          `[paperclip] Injected ${runtimeMcpServers.length} run-scoped MCP server(s) into Antigravity.\n`,
+        );
+      }
+
       const attemptLoggedEnv = buildInvocationEnvForLogs(env, {
         runtimeEnv: attemptRuntimeEnv,
         includeRuntimeKeys: ["HOME", "PATH"],
