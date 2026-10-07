@@ -18,3 +18,14 @@ Reproduz a imagem customizada usada pela Journey Studios sem editar containers e
 ```
 
 Não usar a imagem oficial diretamente no Compose. Sempre gerar e validar a imagem Journey.
+
+
+## Garantias de promoção
+
+- dependências instaladas com `pnpm --frozen-lockfile`;
+- `verify.sh` executado obrigatoriamente pelo deploy antes de alterar tags;
+- Compose permanece em `paperclip:agy`;
+- deploys serializados por lock;
+- confirmação do image ID efetivamente em execução;
+- rollback automático se a promoção não ficar saudável;
+- `dangerouslySkipPermissions` permanece opt-in (default false).
