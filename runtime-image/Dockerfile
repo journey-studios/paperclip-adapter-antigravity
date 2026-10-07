@@ -8,7 +8,7 @@ RUN git apply --check /tmp/paperclip-journey.patch \
  && git apply --whitespace=nowarn /tmp/paperclip-journey.patch
 
 ENV NODE_ENV=development
-RUN CI=1 pnpm install --no-frozen-lockfile --ignore-scripts
+RUN CI=1 pnpm install --frozen-lockfile --ignore-scripts
 RUN pnpm exec vitest run \
       packages/adapters/cursor-local/src/server/parse.test.ts \
       packages/adapters/cursor-local/src/server/execute.provider.test.ts \
