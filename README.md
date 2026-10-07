@@ -172,3 +172,10 @@ Provider quota comes from Antigravity `/usage`. The local fallback and probe beh
 ## License
 
 MIT © Journey Studios
+
+
+## Journey Studios runtime image
+
+A implantação da Journey Studios usa uma imagem customizada do Paperclip para preservar a integração `agy_local` e patches operacionais que ainda não existem upstream.
+
+A receita reproduzível, patches, validação, deploy/rollback e o runbook de upgrade ficam em [`deployment/paperclip-runtime/`](deployment/paperclip-runtime/README.md). Não substitua `paperclip:agy` diretamente pela imagem oficial.
