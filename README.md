@@ -5,7 +5,7 @@
 
 Standalone external adapter plugin for [Paperclip AI](https://github.com/paperclipai/paperclip) that integrates the Google Antigravity (`agy`) CLI runtime.
 
-Designed as an **isolated, upgrade-safe external plugin**: installs cleanly into Paperclip's persistent volume without modifying Paperclip's core codebase or Docker images, fully surviving upstream container updates (`docker compose pull`).
+Designed as an **isolated external plugin** that can be installed into Paperclip's persistent storage without embedding organization-specific infrastructure in this repository. Deployment recipes, production image overlays, backups, credentials, and environment-specific runbooks should live in private infrastructure repositories.
 
 ---
 
@@ -68,8 +68,8 @@ Copy the package into the Paperclip persistent storage directory (e.g. `/papercl
 
 ```bash
 # Example copying to a remote VPS running Paperclip
-ssh root@<vps-ip> 'mkdir -p /paperclip/extensions/paperclip-adapter-antigravity'
-scp -r ./dist ./ui-parser.cjs ./package.json root@<vps-ip>:/paperclip/extensions/paperclip-adapter-antigravity/
+ssh <user>@<host> 'mkdir -p /paperclip/extensions/paperclip-adapter-antigravity'
+scp -r ./dist ./ui-parser.cjs ./package.json <user>@<host>:/paperclip/extensions/paperclip-adapter-antigravity/
 ```
 
 ### 3. Register in Paperclip
@@ -83,20 +83,12 @@ Add the adapter to `/paperclip/adapter-plugins.json`:
     "localPath": "/paperclip/extensions/paperclip-adapter-antigravity",
     "version": "1.0.0",
     "type": "agy_local",
-    "installedAt": "2026-10-06T12:00:00.000Z"
+    "installedAt": "2026-01-01T00:00:00.000Z"
   }
 ]
 ```
 
-### 4. Enable Quota Bars in UI (Optional / Quick Patch)
-
-Paperclip v0.3.x limits the frontend Subscription Quota card to `anthropic` and `openai` by default. To display the Google quota bars:
-
-```bash
-sh scripts/patch-ui.sh
-```
-
-### 5. Restart Paperclip
+### 4. Restart Paperclip
 
 ```bash
 docker compose restart paperclip-app
@@ -112,8 +104,8 @@ Before using this adapter, ensure your host or Docker container meets the follow
    - If running inside Docker, bind-mount the `agy` binary:
      ```yaml
      volumes:
-       - /root/.local/bin/agy:/usr/local/bin/agy:ro
-       - /root/.gemini:/paperclip/.gemini:rw
+       - /path/to/agy:/usr/local/bin/agy:ro
+       - /path/to/gemini-home:/paperclip/.gemini:rw
      ```
 2. **Google Antigravity Authentication**:
    - Log in once on your host with:
