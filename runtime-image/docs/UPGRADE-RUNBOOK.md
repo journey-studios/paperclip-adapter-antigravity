@@ -28,7 +28,7 @@ runtime limpo baseado novamente na imagem oficial
 paperclip:agy-<versão>
 ```
 
-O builder instala devDependencies, executa as regressões focadas e compila. O estágio runtime não herda essas devDependencies. O runner Rust não é recompilado quando não foi alterado; preservamos o binário oficial da imagem base.
+O builder instala devDependencies com `--frozen-lockfile`, executa as regressões focadas e compila. O estágio runtime não herda essas devDependencies. O runner Rust não é recompilado quando não foi alterado; preservamos o binário oficial da imagem base.
 
 ## Conteúdo do overlay
 
@@ -62,6 +62,7 @@ Antes de trocar produção:
 - executar os testes focados de Cursor/custos;
 - gerar dump do PostgreSQL;
 - preservar o `docker-compose.yml`;
+- executar `verify.sh` na candidata antes de qualquer mutação;
 - criar tag de rollback para a imagem atualmente em uso;
 - confirmar que os mounts do `agy` e das credenciais Gemini permanecem iguais.
 
@@ -71,6 +72,8 @@ Antes de trocar produção:
 cd /opt/paperclip-build/runtime-image
 ./scripts/deploy.sh paperclip:agy-cursor-cost-v1
 ```
+
+O script recusa deploy concorrente, mantém o Compose em `paperclip:agy`, promove a candidata somente após `verify.sh`, aguarda readiness e confirma que o image ID do container é exatamente o da candidata. Em falha pós-promoção, repõe automaticamente a imagem anterior.
 
 Depois, validar:
 
@@ -88,9 +91,12 @@ O script de deploy cria um dump PostgreSQL, snapshot do Compose e uma tag `paper
 
 Para rollback:
 
-1. apontar `image:` no Compose para a tag de rollback;
-2. executar `docker compose up -d --no-deps paperclip`;
-3. validar API, UI, `agy_local` e Cursor.
+1. **não altere o Compose para uma tag de rollback**; ele deve permanecer em `paperclip:agy`;
+2. repromova a imagem escolhida para o tag estável, por exemplo `docker tag paperclip:agy-rollback-<timestamp> paperclip:agy`;
+3. execute `docker compose up -d --force-recreate paperclip`;
+4. valide que o container ativo usa o image ID esperado e então valide API, UI, `agy_local` e Cursor.
+
+O `deploy.sh` automatiza rollback em falha de readiness, mismatch de image ID, erro e sinais INT/TERM após a promoção. Ele também serializa deploys com `flock`, normaliza o Compose para `paperclip:agy` e executa `verify.sh` antes de qualquer mutação.
 
 Restore de banco só é necessário se uma atualização tiver aplicado migration incompatível. Este overlay de custos não cria migration.
 
@@ -143,3 +149,26 @@ O typecheck completo da UI dessa release apresenta erros em `native-run-events-b
 - rollback imediato do deploy reproduzível: `paperclip:agy-rollback-20261007T020617Z`;
 - rollback para a imagem original anterior a esta mudança permanece disponível em `paperclip:agy-rollback-20261007T015505Z`;
 - JOU-14 / run `8496b6c0-279e-4cdb-bf96-aac79267b30f` validou a imagem construída pela receita: provider `cursor`, input `26,474`, cache read `92,923`, output `882`, billing `subscription_included`, cost status `unpriced`.
+
+
+## Segurança do Antigravity
+
+`dangerouslySkipPermissions` tem default **false** quando omitido. O flag `--dangerously-skip-permissions` só pode ser enviado quando a configuração estiver explicitamente em `true`. Os testes focados do build verificam o comportamento omitido, `false` e `true`.
+
+
+## Postura de segurança verificada em produção
+
+Verificado em 2026-10-06/07 antes do merge desta receita:
+
+- container Paperclip: `Privileged=false`;
+- `CapAdd`: nenhum capability adicional;
+- processo do container atualmente roda como `root`;
+- root filesystem não está read-only;
+- volume `/paperclip`: read-write;
+- credenciais Gemini montadas em `/paperclip/.gemini` e `/root/.gemini`: read-write;
+- binário `/usr/local/bin/agy`: bind read-only;
+- `/opt/scripts`: bind read-only.
+
+Os quatro agentes `agy_local` existentes (CEO, CMO, Content & SEO Specialist e Social & Creative Lead) possuem `dangerouslySkipPermissions: true` explicitamente. Portanto, mudar o default omitido para `false` não altera esses agentes existentes. Novos agentes ou configurações sem esse campo permanecem seguros por padrão.
+
+Rodar como root e manter credenciais/volume persistente em RW é um risco operacional conhecido e deve ser tratado em uma etapa separada de hardening, com teste de compatibilidade e rollback; não deve ser alterado incidentalmente neste patch de contabilização/deploy.
