@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
-import { discoverAgySessionArtifacts, execute, modelHasEffortSuffix, resolveAgyPrintTimeoutSec } from "./execute.js";
+import { buildAgyMcpConfig, discoverAgySessionArtifacts, execute, modelHasEffortSuffix, resolveAgyPrintTimeoutSec } from "./execute.js";
 import { DENIED_ACTION_RUN, SIMPLE_RUN, TOOL_ERROR_RECOVERED_RUN } from "./fixtures.test-util.js";
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
@@ -34,6 +34,85 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
     ensureAdapterExecutionTargetRuntimeCommandInstalled: vi.fn(async () => {}),
     resolveAdapterExecutionTargetCommandForLogs: vi.fn(async (cmd: string) => cmd),
   };
+});
+
+describe("agy runtime MCP config", () => {
+  it("renders Paperclip runtime MCP servers in Antigravity config format", () => {
+    const config = buildAgyMcpConfig([
+      {
+        name: "Notion",
+        url: "https://paper.example/mcp/gateways/notion",
+        token: "run-token",
+        connectionId: "connection-1",
+      },
+    ]);
+
+    expect(config).toEqual({
+      mcpServers: {
+        Notion: {
+          disabled: false,
+          headers: { Authorization: "Bearer run-token" },
+          serverUrl: "https://paper.example/mcp/gateways/notion",
+        },
+      },
+    });
+  });
+
+  it("preserves global MCP config and renames colliding runtime servers", () => {
+    const config = buildAgyMcpConfig(
+      [
+        {
+          name: "Notion",
+          url: "https://paper.example/mcp/runtime-notion",
+          token: "run-token",
+          connectionId: "runtime-notion",
+        },
+      ],
+      {
+        customSetting: "keep-me",
+        mcpServers: {
+          Notion: {
+            disabled: false,
+            serverUrl: "https://global.example/mcp/notion",
+          },
+        },
+      },
+    );
+
+    expect(config).toEqual({
+      customSetting: "keep-me",
+      mcpServers: {
+        Notion: {
+          disabled: false,
+          serverUrl: "https://global.example/mcp/notion",
+        },
+        "Notion-2": {
+          disabled: false,
+          headers: { Authorization: "Bearer run-token" },
+          serverUrl: "https://paper.example/mcp/runtime-notion",
+        },
+      },
+    });
+  });
+
+  it("keeps duplicate display names without overwriting servers", () => {
+    const config = buildAgyMcpConfig([
+      {
+        name: "Paperclip",
+        url: "https://paper.example/mcp/one",
+        token: "one",
+        connectionId: "one",
+      },
+      {
+        name: "Paperclip",
+        url: "https://paper.example/mcp/two",
+        token: "two",
+        connectionId: "two",
+      },
+    ]);
+
+    expect(Object.keys(config.mcpServers)).toEqual(["Paperclip", "Paperclip-2"]);
+  });
 });
 
 describe("agy-local execute", () => {

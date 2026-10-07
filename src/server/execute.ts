@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult, UsageSummary } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionContext, AdapterExecutionResult, AdapterRuntimeMcpServer, UsageSummary } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -156,6 +156,121 @@ export function resolveAgyPrintTimeoutSec(timeoutSec: number): number {
   return Math.max(30, timeoutSec - margin);
 }
 
+function recordOrEmpty(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+export function buildAgyMcpConfig(
+  servers: AdapterRuntimeMcpServer[],
+  existingConfig: unknown = {},
+): Record<string, unknown> {
+  const existing = recordOrEmpty(existingConfig);
+  const existingServers = recordOrEmpty(existing.mcpServers);
+  const mcpServers: Record<string, unknown> = { ...existingServers };
+  const usedNames = new Set<string>(Object.keys(existingServers));
+
+  for (const server of servers) {
+    const baseName = server.name.trim() || server.connectionId.trim() || "paperclip";
+    let name = baseName;
+    let suffix = 2;
+    while (usedNames.has(name)) {
+      name = `${baseName}-${suffix}`;
+      suffix += 1;
+    }
+    usedNames.add(name);
+    mcpServers[name] = {
+      disabled: false,
+      headers: { Authorization: `Bearer ${server.token}` },
+      serverUrl: server.url,
+    };
+  }
+
+  return { ...existing, mcpServers };
+}
+
+async function readAgyMcpConfig(filePath: string): Promise<Record<string, unknown>> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`Antigravity MCP config at ${filePath} must be a JSON object.`);
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+async function symlinkEntries(
+  sourceDir: string,
+  targetDir: string,
+  excludedNames: Set<string> = new Set(),
+): Promise<void> {
+  const entries = await fs.readdir(sourceDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (excludedNames.has(entry.name)) continue;
+    const source = path.join(sourceDir, entry.name);
+    const target = path.join(targetDir, entry.name);
+    await fs.symlink(source, target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    });
+  }
+}
+
+async function prepareAgyRuntimeMcpHome(input: {
+  runId: string;
+  sourceHome: string;
+  servers: AdapterRuntimeMcpServer[];
+}): Promise<{ homeDir: string; cleanup: () => Promise<void> }> {
+  const safeRunId = input.runId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-agy-mcp-${safeRunId}-`));
+  await fs.chmod(homeDir, 0o700);
+
+  try {
+    const sourceGemini = path.join(input.sourceHome, ".gemini");
+    const sourceAntigravityCli = path.join(sourceGemini, "antigravity-cli");
+    const sourceConfig = path.join(sourceGemini, "config");
+    const sourceMcpConfig = path.join(sourceConfig, "mcp_config.json");
+    const targetGemini = path.join(homeDir, ".gemini");
+    const targetConfig = path.join(targetGemini, "config");
+
+    // Ensure CLI state created during this attempt (sessions, brain artifacts,
+    // logs, etc.) lands in the persistent HOME even on a first Antigravity run.
+    await fs.mkdir(sourceAntigravityCli, { recursive: true, mode: 0o700 });
+    await fs.chmod(sourceAntigravityCli, 0o700);
+
+    await symlinkEntries(input.sourceHome, homeDir, new Set([".gemini"]));
+    await fs.mkdir(targetConfig, { recursive: true });
+
+    await symlinkEntries(sourceGemini, targetGemini, new Set(["config"]));
+    await symlinkEntries(
+      sourceConfig,
+      targetConfig,
+      new Set(["mcp_config.json"]),
+    );
+
+    const existingMcpConfig = await readAgyMcpConfig(sourceMcpConfig);
+    await fs.writeFile(
+      path.join(targetConfig, "mcp_config.json"),
+      `${JSON.stringify(buildAgyMcpConfig(input.servers, existingMcpConfig), null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    return {
+      homeDir,
+      cleanup: async () => {
+        await fs.rm(homeDir, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await fs.rm(homeDir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 export async function discoverAgySessionArtifacts(sessionId: string): Promise<string[]> {
   if (!sessionId || typeof sessionId !== "string") return [];
   const homedir = os.homedir();
@@ -223,6 +338,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const disableSlashCommands = Boolean(config.disableSlashCommands);
   const inputFormat = asString(config.inputFormat, "stream-json").trim().toLowerCase();
   const useStreamJsonInput = inputFormat !== "text";
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -372,12 +488,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     cwd,
     runtimeEnv,
   );
-
-  const loggedEnv = buildInvocationEnvForLogs(env, {
-    runtimeEnv,
-    includeRuntimeKeys: ["HOME", "PATH"],
-    resolvedCommand,
-  });
 
   const extraArgs = (() => {
     const fromExtraArgs = asStringArray(config.extraArgs);
@@ -544,47 +654,84 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return args;
   };
 
+  if (runtimeMcpServers.length > 0 && executionTargetIsRemote) {
+    await onLog(
+      "stdout",
+      `[paperclip] ${runtimeMcpServers.length} runtime MCP server(s) are available but cannot be injected into a remote agy execution target yet.\n`,
+    );
+  }
+
   const runAttempt = async (resumeSessionId: string | null) => {
     const args = buildArgs(resumeSessionId);
-    if (onMeta) {
-      await onMeta({
-        adapterType: "agy_local",
-        command: resolvedCommand,
-        cwd: effectiveExecutionCwd,
-        commandArgs: args.map((arg) => (arg === prompt ? `<prompt ${prompt.length} chars>` : arg)),
-        env: loggedEnv,
-        prompt,
-        promptMetrics,
-        context,
+    let attemptRuntimeEnv = runtimeEnv;
+    let cleanupRuntimeMcpHome: (() => Promise<void>) | null = null;
+
+    if (runtimeMcpServers.length > 0 && !executionTargetIsRemote) {
+      const isolatedHome = await prepareAgyRuntimeMcpHome({
+        runId,
+        sourceHome: runtimeEnv.HOME || os.homedir(),
+        servers: runtimeMcpServers,
       });
+      attemptRuntimeEnv = { ...runtimeEnv, HOME: isolatedHome.homeDir };
+      cleanupRuntimeMcpHome = isolatedHome.cleanup;
     }
 
-    const stdin = useStreamJsonInput
-      ? JSON.stringify({ event: "user", message: { content: prompt } }) + "\n"
-      : undefined;
+    try {
+      if (cleanupRuntimeMcpHome) {
+        await onLog(
+          "stdout",
+          `[paperclip] Injected ${runtimeMcpServers.length} run-scoped MCP server(s) into Antigravity.\n`,
+        );
+      }
 
-    const proc = await runAdapterExecutionTargetProcess(
-      runId,
-      runtimeExecutionTarget,
-      command,
-      args,
-      {
-        cwd,
-        env: runtimeEnv,
-        stdin,
-        timeoutSec,
-        graceSec,
-        onSpawn,
-        onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog,
-      },
-    );
+      const attemptLoggedEnv = buildInvocationEnvForLogs(env, {
+        runtimeEnv: attemptRuntimeEnv,
+        includeRuntimeKeys: ["HOME", "PATH"],
+        resolvedCommand,
+      });
 
-    return {
-      proc,
-      rawStderr: proc.stderr,
-      parsed: parseAgyJsonl(proc.stdout),
-    };
+      if (onMeta) {
+        await onMeta({
+          adapterType: "agy_local",
+          command: resolvedCommand,
+          cwd: effectiveExecutionCwd,
+          commandArgs: args.map((arg) => (arg === prompt ? `<prompt ${prompt.length} chars>` : arg)),
+          env: attemptLoggedEnv,
+          prompt,
+          promptMetrics,
+          context,
+        });
+      }
+
+      const stdin = useStreamJsonInput
+        ? JSON.stringify({ event: "user", message: { content: prompt } }) + "\n"
+        : undefined;
+
+      const proc = await runAdapterExecutionTargetProcess(
+        runId,
+        runtimeExecutionTarget,
+        command,
+        args,
+        {
+          cwd,
+          env: attemptRuntimeEnv,
+          stdin,
+          timeoutSec,
+          graceSec,
+          onSpawn,
+          onRuntimeProgress: ctx.onRuntimeProgress,
+          onLog,
+        },
+      );
+
+      return {
+        proc,
+        rawStderr: proc.stderr,
+        parsed: parseAgyJsonl(proc.stdout),
+      };
+    } finally {
+      await cleanupRuntimeMcpHome?.();
+    }
   };
 
   type Attempt = Awaited<ReturnType<typeof runAttempt>>;
