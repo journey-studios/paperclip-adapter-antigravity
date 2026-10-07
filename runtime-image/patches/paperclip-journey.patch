@@ -1306,7 +1306,7 @@ index 000000000..125cb3d52
 +});
 diff --git a/packages/adapters/agy-local/src/server/execute.ts b/packages/adapters/agy-local/src/server/execute.ts
 new file mode 100644
-index 000000000..0c5ca3841
+index 000000000..0878f230b
 --- /dev/null
 +++ b/packages/adapters/agy-local/src/server/execute.ts
 @@ -0,0 +1,690 @@
@@ -1454,7 +1454,7 @@ index 000000000..0c5ca3841
 +  const agentPersona = asString(config.agent ?? config.agentPersona, "").trim();
 +  const jsonSchema = asString(config.jsonSchema ?? config.json_schema, "").trim();
 +  const sandbox = Boolean(config.sandbox);
-+  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
++  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, false);
 +  const additionalDirs = Array.isArray(config.addDirs)
 +    ? config.addDirs.map((d) => asString(d, "").trim()).filter(Boolean)
 +    : [];
@@ -5091,7 +5091,7 @@ index 000000000..3cd9c9cb7
 +});
 diff --git a/packages/adapters/agy-local/src/server/test.ts b/packages/adapters/agy-local/src/server/test.ts
 new file mode 100644
-index 000000000..14554afa5
+index 000000000..1390a1afd
 --- /dev/null
 +++ b/packages/adapters/agy-local/src/server/test.ts
 @@ -0,0 +1,203 @@
@@ -5217,7 +5217,7 @@ index 000000000..14554afa5
 +    const mode = asString(config.mode, "").trim();
 +    const agentPersona = asString(config.agent ?? config.agentPersona, "").trim();
 +    const sandbox = Boolean(config.sandbox);
-+    const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
++    const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, false);
 +    const helloProbeTimeoutSec = Math.max(1, asNumber(config.helloProbeTimeoutSec, 60));
 +    const extraArgs = asStringArray(config.extraArgs);
 +    const inputFormat = asString(config.inputFormat, "stream-json").trim().toLowerCase();
@@ -5574,7 +5574,7 @@ index 000000000..c70b27656
 +});
 diff --git a/packages/adapters/agy-local/src/ui/build-config.ts b/packages/adapters/agy-local/src/ui/build-config.ts
 new file mode 100644
-index 000000000..ecd01071c
+index 000000000..3cfe25e9b
 --- /dev/null
 +++ b/packages/adapters/agy-local/src/ui/build-config.ts
 @@ -0,0 +1,43 @@
@@ -5604,7 +5604,7 @@ index 000000000..ecd01071c
 +  if (raw.project) ac.project = String(raw.project).trim();
 +  if (raw.printTimeout) ac.printTimeout = String(raw.printTimeout).trim();
 +  if (typeof raw.disableSlashCommands === "boolean") ac.disableSlashCommands = raw.disableSlashCommands;
-+  ac.dangerouslySkipPermissions = typeof v.dangerouslySkipPermissions === "boolean" ? v.dangerouslySkipPermissions : true;
++  ac.dangerouslySkipPermissions = typeof v.dangerouslySkipPermissions === "boolean" ? v.dangerouslySkipPermissions : false;
 +  ac.timeoutSec = 0;
 +  ac.graceSec = 15;
 +  if (v.workspaceStrategyType === "git_worktree") {
@@ -6320,6 +6320,53 @@ index 8644e106a..01d3a3f03 100644
        );
        usage.outputTokens += asNumber(
          usageObj.output_tokens,
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index c34d669b3..5e7a937c7 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -169,6 +169,22 @@ importers:
+         specifier: ^7.0.2
+         version: 7.0.2
+ 
++  packages/adapters/agy-local:
++    dependencies:
++      '@paperclipai/adapter-utils':
++        specifier: workspace:*
++        version: link:../../adapter-utils
++      picocolors:
++        specifier: ^1.1.1
++        version: 1.1.1
++    devDependencies:
++      '@types/node':
++        specifier: ^24.0.0
++        version: 24.13.3
++      typescript:
++        specifier: ^7.0.2
++        version: 7.0.2
++
+   packages/adapters/claude-local:
+     dependencies:
+       '@agentclientprotocol/claude-agent-acp':
+@@ -900,6 +916,9 @@ importers:
+       '@opentelemetry/api':
+         specifier: ^1.9.0
+         version: 1.9.1
++      '@paperclipai/adapter-agy-local':
++        specifier: workspace:*
++        version: link:../packages/adapters/agy-local
+       '@paperclipai/adapter-claude-local':
+         specifier: workspace:*
+         version: link:../packages/adapters/claude-local
+@@ -1108,6 +1127,9 @@ importers:
+       '@mdxeditor/editor':
+         specifier: ^4.2.3
+         version: 4.2.3(@codemirror/language@6.12.4)(@lezer/highlight@1.2.3)(@types/react-dom@19.2.5(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@7.0.2)(yjs@13.6.32)
++      '@paperclipai/adapter-agy-local':
++        specifier: workspace:*
++        version: link:../packages/adapters/agy-local
+       '@paperclipai/adapter-claude-local':
+         specifier: workspace:*
+         version: link:../packages/adapters/claude-local
 diff --git a/server/package.json b/server/package.json
 index a2ecf6d49..bc6d7b26a 100644
 --- a/server/package.json
@@ -6829,7 +6876,7 @@ index 000000000..edda06ddd
 +
 diff --git a/ui/src/adapters/agy-local/config-fields.tsx b/ui/src/adapters/agy-local/config-fields.tsx
 new file mode 100644
-index 000000000..baeeec6e2
+index 000000000..45c149285
 --- /dev/null
 +++ b/ui/src/adapters/agy-local/config-fields.tsx
 @@ -0,0 +1,248 @@
@@ -6965,11 +7012,11 @@ index 000000000..baeeec6e2
 +        hint={help.dangerouslySkipPermissions}
 +        checked={
 +          isCreate
-+            ? Boolean(values?.dangerouslySkipPermissions ?? true)
++            ? Boolean(values?.dangerouslySkipPermissions ?? false)
 +            : eff(
 +                "adapterConfig",
 +                "dangerouslySkipPermissions",
-+                Boolean(config.dangerouslySkipPermissions ?? true),
++                Boolean(config.dangerouslySkipPermissions ?? false),
 +              )
 +        }
 +        onChange={(v) =>
