@@ -67,9 +67,9 @@ await esbuild.build({
 
 console.log("[build] Generating TypeScript declarations...");
 try {
-  execSync("npx tsc --emitDeclarationOnly", { stdio: "inherit" });
+  execSync("npx tsc-rs --emitDeclarationOnly", { stdio: "inherit" });
 } catch (e) {
-  console.warn("[build] Warning: tsc declaration emit skipped or failed (runtime bundle intact)");
+  console.warn("[build] Warning: tsc-rs declaration emit skipped or failed (runtime bundle intact)");
 }
 
 console.log("[build] Build completed successfully.");
