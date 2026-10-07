@@ -58,6 +58,43 @@ describe("agy runtime MCP config", () => {
     });
   });
 
+  it("preserves global MCP config and renames colliding runtime servers", () => {
+    const config = buildAgyMcpConfig(
+      [
+        {
+          name: "Notion",
+          url: "https://paper.example/mcp/runtime-notion",
+          token: "run-token",
+          connectionId: "runtime-notion",
+        },
+      ],
+      {
+        customSetting: "keep-me",
+        mcpServers: {
+          Notion: {
+            disabled: false,
+            serverUrl: "https://global.example/mcp/notion",
+          },
+        },
+      },
+    );
+
+    expect(config).toEqual({
+      customSetting: "keep-me",
+      mcpServers: {
+        Notion: {
+          disabled: false,
+          serverUrl: "https://global.example/mcp/notion",
+        },
+        "Notion-2": {
+          disabled: false,
+          headers: { Authorization: "Bearer run-token" },
+          serverUrl: "https://paper.example/mcp/runtime-notion",
+        },
+      },
+    });
+  });
+
   it("keeps duplicate display names without overwriting servers", () => {
     const config = buildAgyMcpConfig([
       {
