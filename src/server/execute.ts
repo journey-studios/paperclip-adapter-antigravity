@@ -240,6 +240,7 @@ async function prepareAgyRuntimeMcpHome(input: {
     // Ensure CLI state created during this attempt (sessions, brain artifacts,
     // logs, etc.) lands in the persistent HOME even on a first Antigravity run.
     await fs.mkdir(sourceAntigravityCli, { recursive: true, mode: 0o700 });
+    await fs.chmod(sourceAntigravityCli, 0o700);
 
     await symlinkEntries(input.sourceHome, homeDir, new Set([".gemini"]));
     await fs.mkdir(targetConfig, { recursive: true });
