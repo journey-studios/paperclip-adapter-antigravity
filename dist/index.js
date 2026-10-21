@@ -6773,6 +6773,8 @@ function createServerAdapter() {
     syncSkills: syncAgySkills,
     models,
     supportsLocalAgentJwt: true,
+    // Paperclip core only honors this for the operator Retry of one failed run.
+    supportsExplicitRetry: true,
     supportsInstructionsBundle: true,
     instructionsPathKey: "instructionsFilePath",
     requiresMaterializedRuntimeSkills: false,

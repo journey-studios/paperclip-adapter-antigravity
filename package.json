@@ -1,6 +1,6 @@
 {
   "name": "paperclip-adapter-antigravity",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Standalone Paperclip external adapter for Google Antigravity (agy)",
   "type": "module",
   "license": "MIT",
@@ -45,6 +45,7 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
+    "test:bundle": "node --test test/*.test.mjs",
     "clean": "rm -rf dist"
   },
   "dependencies": {
