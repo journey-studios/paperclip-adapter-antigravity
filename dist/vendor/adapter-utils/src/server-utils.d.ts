@@ -542,7 +542,7 @@ export declare function refreshPaperclipWorkspaceEnvForExecution(input: {
     workspaceHints: Array<Record<string, unknown>>;
 };
 export declare function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
-export declare function defaultPathForPlatform(): "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem" | "/usr/local/bin:/opt/homebrew/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
+export declare function defaultPathForPlatform(): "/usr/local/bin:/opt/homebrew/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin" | "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem";
 export declare function resolveCommandForLogs(command: string, cwd: string, env: NodeJS.ProcessEnv, options?: {
     remoteExecution?: RemoteExecutionSpec | null;
 }): Promise<string>;

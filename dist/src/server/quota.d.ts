@@ -13,12 +13,22 @@ export interface ProviderQuotaResult {
     windows: QuotaWindow[];
 }
 /**
+ * Parse the provider-authoritative payload returned by:
+ *   agy --output-format json --print /usage
+ */
+export declare function parseAgyUsageQuotaOutput(stdout: string): ProviderQuotaResult | null;
+/**
  * Record token consumption from an agent run into the persistent quota history file.
  */
 export declare function recordAgyRunUsage(tokens: number, model?: string): Promise<void>;
 /**
- * Return provider quota rate limits for Antigravity (5h and Weekly windows).
- * Evaluates the persistent sliding window ledger and returns ProviderQuotaResult.
+ * Return Antigravity subscription quota.
+ *
+ * Prefer the provider-authoritative /usage slash command exposed by agy.
+ * The local token ledger remains only as a compatibility fallback for older
+ * CLI builds or transient command failures.
  */
 export declare function getQuotaWindows(): Promise<ProviderQuotaResult>;
+/** Test helper. */
+export declare function resetAgyQuotaCacheForTests(): void;
 //# sourceMappingURL=quota.d.ts.map
