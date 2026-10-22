@@ -42,6 +42,10 @@ export interface ParsedAgyOutput {
     permissionMode: string | null;
     assistantText: string;
     malformedLines: number;
+    /** True when this invocation completed an assistant-response step. */
+    completedAssistantResponse: boolean;
+    /** True when this invocation emitted an explicit current-turn error_message step. */
+    sawErrorStep: boolean;
 }
 export type AgyParsedStream = ParsedAgyOutput;
 export declare function parseAgyUsage(rawUsage: unknown): {

@@ -825,6 +825,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const fallbackErrorMessage =
       outcomeError || stderrLine || `Antigravity exited with code ${synthesizedExitCode ?? -1}`;
     const failed = outcome.failed;
+    // `summary` is only the first line of the answer, and Paperclip falls back to it
+    // when it builds the issue comment, so multi-paragraph answers reached chat cut
+    // down to their opening line. Mark only agy's explicit terminal response as final:
+    // the assistantText fallback behind `summary` can be inter-tool narration.
+    const finalResponseText = failed ? "" : (attempt.parsed.response ?? "").trim();
 
     const provider = inferModelProvider(model);
 
@@ -867,6 +872,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           : {}),
         ...(attempt.parsed.malformedLines > 0
           ? { malformed_stream_lines: attempt.parsed.malformedLines }
+          : {}),
+        ...(finalResponseText
+          ? { finalResponseDisposition: "final", finalResponseText }
           : {}),
         ...(suppressQuotaFailure ? { stale_quota_error_suppressed: true } : {}),
       },

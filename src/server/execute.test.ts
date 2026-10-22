@@ -622,6 +622,41 @@ describe("agy-local execute run outcome", () => {
     expect(result.summary).toBeNull();
   });
 
+  it("marks the full terminal response as final while summary stays the first line", async () => {
+    const answer = "Pending decisions:\n\n1. **JOU-551** - production deploy\n2. **JOU-90** - Telegram canary";
+    const stdout = SIMPLE_RUN.replace(
+      '"response":"HELLO_AGY\\n"',
+      `"response":${JSON.stringify(`${answer}\n`)}`,
+    );
+    const { result } = await runWithOutput(stdout);
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("Pending decisions:");
+    expect(result.resultJson).toMatchObject({
+      finalResponseDisposition: "final",
+      finalResponseText: answer,
+    });
+  });
+
+  it("does not mark a failed run's response as final", async () => {
+    const stdout = DENIED_ACTION_RUN.replace('"response":""', '"response":"I could not write the file."').replace(
+      '"status":"SUCCESS"',
+      '"status":"ERROR"',
+    );
+    const { result } = await runWithOutput(stdout, "", 1);
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson).not.toHaveProperty("finalResponseDisposition");
+    expect(result.resultJson).not.toHaveProperty("finalResponseText");
+  });
+
+  it("does not mark streamed assistant text as final when the result has no response", async () => {
+    const stdout = SIMPLE_RUN.replace('"response":"HELLO_AGY\\n",', "");
+    const { result } = await runWithOutput(stdout);
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("HELLO_AGY");
+    expect(result.resultJson).not.toHaveProperty("finalResponseDisposition");
+    expect(result.resultJson).not.toHaveProperty("finalResponseText");
+  });
+
   it("keeps a run that answered after a denied action successful but still logs the denial", async () => {
     const stdout = DENIED_ACTION_RUN.replace('"response":""', '"response":"Wrote the text into my reply instead."');
     const { result, logs } = await runWithOutput(stdout);

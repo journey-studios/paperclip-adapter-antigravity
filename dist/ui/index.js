@@ -699,8 +699,11 @@ init_server_utils();
 import fs11 from "node:fs/promises";
 import path13 from "node:path";
 import os10 from "node:os";
+import { execFile as execFile5 } from "node:child_process";
+import { promisify as promisify3 } from "node:util";
 var FIVE_HOURS_MS = 5 * 60 * 60 * 1e3;
 var SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1e3;
+var execFileAsync = promisify3(execFile5);
 
 // src/server/execute.ts
 var __moduleDir2 = path14.dirname(fileURLToPath2(import.meta.url));

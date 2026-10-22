@@ -5086,6 +5086,8 @@ function parseAgyJsonl(stdout) {
   const availableTools = [];
   let assistantText = "";
   let malformedLines = 0;
+  let completedAssistantResponse = false;
+  let sawErrorStep = false;
   let sawJsonEvent = false;
   const toolsByStep = /* @__PURE__ */ new Map();
   let lastStepUsage = null;
@@ -5127,9 +5129,11 @@ function parseAgyJsonl(stdout) {
       if (parsedStepUsage) lastStepUsage = parsedStepUsage;
       const stepType = asString(stepUpdate.step_type, "");
       const state = asString(stepUpdate.state, "");
+      if (stepType === "error_message") sawErrorStep = true;
       if (stepType === "agent_response") {
         const delta = typeof stepUpdate.text_delta === "string" ? stepUpdate.text_delta : "";
         if (delta) assistantText += delta;
+        if (state === "DONE") completedAssistantResponse = true;
       }
       if (stepType === "tool") {
         const stepIndex = asNumber(stepUpdate.step_index, -1);
@@ -5234,7 +5238,9 @@ function parseAgyJsonl(stdout) {
     availableTools,
     permissionMode,
     assistantText,
-    malformedLines
+    malformedLines,
+    completedAssistantResponse,
+    sawErrorStep
   };
 }
 function isAgySuccessResult(parsed) {
@@ -5282,7 +5288,7 @@ var AUTH_PATTERNS = [
   /\b401\b/
 ];
 var QUOTA_PATTERNS = [
-  /\bquota\s+(?:exceeded|exhausted)/i,
+  /\bquota\s+(?:reached|exceeded|exhausted)/i,
   /\brate\s?limit(?:ed|s)?\b/i,
   /resource[_\s]exhausted/i,
   /too\s+many\s+requests/i,
@@ -5873,10 +5879,81 @@ function inferModelProvider(model) {
 import fs11 from "node:fs/promises";
 import path13 from "node:path";
 import os10 from "node:os";
+import { execFile as execFile5 } from "node:child_process";
+import { promisify as promisify3 } from "node:util";
 var FIVE_HOURS_MS = 5 * 60 * 60 * 1e3;
 var SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1e3;
 var DEFAULT_5H_TOKEN_LIMIT = 2e6;
 var DEFAULT_WEEKLY_TOKEN_LIMIT = 15e6;
+var DEFAULT_QUOTA_CACHE_MS = 6e4;
+var execFileAsync = promisify3(execFile5);
+var cachedProviderQuota = null;
+function asRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+}
+function asString3(value) {
+  return typeof value === "string" ? value : "";
+}
+function asFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+function quotaWindowLabel(window, name) {
+  if (window.toLowerCase() === "5h" || /five\s*hour/i.test(name)) return "5h";
+  if (window.toLowerCase() === "weekly" || /weekly/i.test(name)) return "Weekly";
+  return name || window || "Quota";
+}
+function parseAgyUsageQuotaOutput(stdout) {
+  let payload;
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  const root = asRecord(payload);
+  const command = asRecord(root.command);
+  if (asString3(command.name) !== "usage") return null;
+  const data = asRecord(command.data);
+  const groups = Array.isArray(data.groups) ? data.groups : [];
+  const windows = [];
+  for (const rawGroup of groups) {
+    const group = asRecord(rawGroup);
+    const groupName = asString3(group.name).trim() || "Antigravity";
+    const groupDescription = asString3(group.description).trim();
+    const buckets = Array.isArray(group.buckets) ? group.buckets : [];
+    for (const rawBucket of buckets) {
+      const bucket = asRecord(rawBucket);
+      const remainingFraction = asFiniteNumber(bucket.remaining_fraction);
+      if (remainingFraction === null) continue;
+      const boundedRemaining = Math.min(1, Math.max(0, remainingFraction));
+      const remainingPercent = Math.round(boundedRemaining * 100);
+      const bucketName = asString3(bucket.name).trim();
+      const window = quotaWindowLabel(asString3(bucket.window), bucketName);
+      const bucketDescription = asString3(bucket.description).trim();
+      windows.push({
+        label: groupName + " \xB7 " + window,
+        usedPercent: 100 - remainingPercent,
+        resetsAt: asString3(bucket.reset_time).trim() || null,
+        valueLabel: String(remainingPercent) + "% remaining",
+        detail: bucketDescription || groupDescription || null
+      });
+    }
+  }
+  if (windows.length === 0) return null;
+  windows.sort((a, b) => {
+    const aGroup = a.label.split(" \xB7 ")[0] ?? "";
+    const bGroup = b.label.split(" \xB7 ")[0] ?? "";
+    if (aGroup !== bGroup) return aGroup.localeCompare(bGroup);
+    if (a.label.endsWith("\xB7 5h")) return -1;
+    if (b.label.endsWith("\xB7 5h")) return 1;
+    return a.label.localeCompare(b.label);
+  });
+  return {
+    provider: "google",
+    source: "antigravity:/usage",
+    ok: true,
+    windows
+  };
+}
 function resolveQuotaStorePath() {
   const custom = process.env.PAPERCLIP_AGY_QUOTA_FILE;
   if (custom) return custom;
@@ -5905,7 +5982,7 @@ async function recordAgyRunUsage(tokens, model) {
     console.warn("[agy_local] Failed to record quota usage:", err);
   }
 }
-async function getQuotaWindows() {
+async function getLocalQuotaEstimate() {
   try {
     const filePath = resolveQuotaStorePath();
     let entries = [];
@@ -5920,60 +5997,78 @@ async function getQuotaWindows() {
     const cutoff5h = now - FIVE_HOURS_MS;
     const cutoffWeekly = now - SEVEN_DAYS_MS;
     let tokens5h = 0;
-    let oldest5hTimestamp = null;
     let tokensWeekly = 0;
-    let oldestWeeklyTimestamp = null;
     for (const entry of entries) {
       if (typeof entry.timestamp !== "number" || typeof entry.tokens !== "number") continue;
       if (entry.timestamp >= cutoffWeekly) {
         tokensWeekly += entry.tokens;
-        if (oldestWeeklyTimestamp === null || entry.timestamp < oldestWeeklyTimestamp) {
-          oldestWeeklyTimestamp = entry.timestamp;
-        }
       }
       if (entry.timestamp >= cutoff5h) {
         tokens5h += entry.tokens;
-        if (oldest5hTimestamp === null || entry.timestamp < oldest5hTimestamp) {
-          oldest5hTimestamp = entry.timestamp;
-        }
       }
     }
     const limit5h = Number(process.env.AGY_5H_TOKEN_LIMIT) || DEFAULT_5H_TOKEN_LIMIT;
     const limitWeekly = Number(process.env.AGY_WEEKLY_TOKEN_LIMIT) || DEFAULT_WEEKLY_TOKEN_LIMIT;
     const used5hPercent = Math.min(100, Math.max(0, Math.round(tokens5h / limit5h * 100)));
     const usedWeeklyPercent = Math.min(100, Math.max(0, Math.round(tokensWeekly / limitWeekly * 100)));
-    const resets5h = oldest5hTimestamp ? new Date(oldest5hTimestamp + FIVE_HOURS_MS).toISOString() : new Date(now + FIVE_HOURS_MS).toISOString();
-    const resetsWeekly = oldestWeeklyTimestamp ? new Date(oldestWeeklyTimestamp + SEVEN_DAYS_MS).toISOString() : new Date(now + SEVEN_DAYS_MS).toISOString();
     const windows = [
       {
         label: "5h",
         usedPercent: used5hPercent,
-        resetsAt: resets5h,
-        valueLabel: `${Math.max(0, 100 - used5hPercent)}% remaining`,
-        detail: `${tokens5h.toLocaleString()} / ${limit5h.toLocaleString()} tokens (5h limit)`
+        resetsAt: null,
+        valueLabel: `${Math.max(0, 100 - used5hPercent)}% remaining (local estimate)`,
+        detail: `${tokens5h.toLocaleString()} / ${limit5h.toLocaleString()} locally observed tokens in 5h; provider quota may differ`
       },
       {
         label: "Weekly",
         usedPercent: usedWeeklyPercent,
-        resetsAt: resetsWeekly,
-        valueLabel: `${Math.max(0, 100 - usedWeeklyPercent)}% remaining`,
-        detail: `${tokensWeekly.toLocaleString()} / ${limitWeekly.toLocaleString()} tokens (7d limit)`
+        resetsAt: null,
+        valueLabel: `${Math.max(0, 100 - usedWeeklyPercent)}% remaining (local estimate)`,
+        detail: `${tokensWeekly.toLocaleString()} / ${limitWeekly.toLocaleString()} locally observed tokens in 7d; provider quota may differ`
       }
     ];
     return {
       provider: "google",
-      source: "antigravity",
+      source: "antigravity-local-estimate",
       ok: true,
       windows
     };
   } catch (err) {
     return {
       provider: "google",
-      source: "antigravity",
+      source: "antigravity-local-estimate",
       ok: false,
       error: err instanceof Error ? err.message : String(err),
       windows: []
     };
+  }
+}
+async function getQuotaWindows() {
+  const now = Date.now();
+  const configuredCacheMs = Number(process.env.PAPERCLIP_AGY_QUOTA_CACHE_MS);
+  const cacheMs = Number.isFinite(configuredCacheMs) && configuredCacheMs >= 0 ? configuredCacheMs : DEFAULT_QUOTA_CACHE_MS;
+  if (cachedProviderQuota && now - cachedProviderQuota.at < cacheMs) {
+    return cachedProviderQuota.result;
+  }
+  const command = process.env.PAPERCLIP_AGY_COMMAND || "agy";
+  const configuredTimeoutMs = Number(process.env.PAPERCLIP_AGY_QUOTA_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0 ? configuredTimeoutMs : 1e4;
+  try {
+    const { stdout } = await execFileAsync(
+      command,
+      ["--output-format", "json", "--print", "/usage"],
+      {
+        timeout: timeoutMs,
+        maxBuffer: 1024 * 1024,
+        env: process.env
+      }
+    );
+    const parsed = parseAgyUsageQuotaOutput(String(stdout));
+    if (!parsed) throw new Error("agy /usage returned an unrecognized payload");
+    cachedProviderQuota = { at: now, result: parsed };
+    return parsed;
+  } catch {
+    return getLocalQuotaEstimate();
   }
 }
 
@@ -5982,6 +6077,50 @@ var __moduleDir2 = path14.dirname(fileURLToPath2(import.meta.url));
 function firstNonEmptyLine(text) {
   return text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
 }
+function isHistoricalQuotaResumeResult(input) {
+  if (!input.resumedSession || (input.exitCode ?? 0) !== 0 || input.stderr.trim()) return false;
+  if (!input.parsed.completedAssistantResponse || input.parsed.sawErrorStep) return false;
+  const response = (input.parsed.response ?? "").trim();
+  const streamed = input.parsed.assistantText.trim();
+  if (!response || !streamed || response !== streamed) return false;
+  return detectAgyQuotaExhausted({ parsed: input.parsed });
+}
+function readUsageSnapshot(value) {
+  const obj = parseObject(value);
+  if (Object.keys(obj).length === 0) return null;
+  const tokenKeys = [
+    "inputTokens",
+    "input_tokens",
+    "outputTokens",
+    "output_tokens",
+    "cachedInputTokens",
+    "cache_read_tokens"
+  ];
+  const hasRecognizedField = tokenKeys.some(
+    (key) => Object.prototype.hasOwnProperty.call(obj, key)
+  );
+  const hasInvalidRecognizedField = tokenKeys.some(
+    (key) => Object.prototype.hasOwnProperty.call(obj, key) && (typeof obj[key] !== "number" || !Number.isFinite(obj[key]))
+  );
+  if (!hasRecognizedField || hasInvalidRecognizedField) return null;
+  return {
+    inputTokens: asNumber(obj.inputTokens ?? obj.input_tokens, 0),
+    outputTokens: asNumber(obj.outputTokens ?? obj.output_tokens, 0),
+    cachedInputTokens: asNumber(obj.cachedInputTokens ?? obj.cache_read_tokens, 0)
+  };
+}
+function deriveUsageDelta(current, previous) {
+  const delta = (now, before) => {
+    const currentValue = now ?? 0;
+    const previousValue = before ?? 0;
+    return currentValue >= previousValue ? currentValue - previousValue : currentValue;
+  };
+  return {
+    inputTokens: delta(current.inputTokens, previous.inputTokens),
+    outputTokens: delta(current.outputTokens, previous.outputTokens),
+    cachedInputTokens: delta(current.cachedInputTokens, previous.cachedInputTokens)
+  };
+}
 function modelHasEffortSuffix2(model) {
   return /-(?:low|medium|high)$/i.test(model.trim());
 }
@@ -5989,6 +6128,95 @@ function resolveAgyPrintTimeoutSec(timeoutSec) {
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) return 0;
   const margin = Math.max(10, Math.floor(timeoutSec * 0.05));
   return Math.max(30, timeoutSec - margin);
+}
+function recordOrEmpty(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function buildAgyMcpConfig(servers, existingConfig = {}) {
+  const existing = recordOrEmpty(existingConfig);
+  const existingServers = recordOrEmpty(existing.mcpServers);
+  const mcpServers = { ...existingServers };
+  const usedNames = new Set(Object.keys(existingServers));
+  for (const server of servers) {
+    const baseName = server.name.trim() || server.connectionId.trim() || "paperclip";
+    let name = baseName;
+    let suffix = 2;
+    while (usedNames.has(name)) {
+      name = `${baseName}-${suffix}`;
+      suffix += 1;
+    }
+    usedNames.add(name);
+    mcpServers[name] = {
+      disabled: false,
+      headers: { Authorization: `Bearer ${server.token}` },
+      serverUrl: server.url
+    };
+  }
+  return { ...existing, mcpServers };
+}
+async function readAgyMcpConfig(filePath) {
+  try {
+    const raw = await fs12.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`Antigravity MCP config at ${filePath} must be a JSON object.`);
+    }
+    return parsed;
+  } catch (error) {
+    if (error.code === "ENOENT") return {};
+    throw error;
+  }
+}
+async function symlinkEntries(sourceDir, targetDir, excludedNames = /* @__PURE__ */ new Set()) {
+  const entries = await fs12.readdir(sourceDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (excludedNames.has(entry.name)) continue;
+    const source = path14.join(sourceDir, entry.name);
+    const target = path14.join(targetDir, entry.name);
+    await fs12.symlink(source, target).catch((error) => {
+      if (error.code !== "EEXIST") throw error;
+    });
+  }
+}
+async function prepareAgyRuntimeMcpHome(input) {
+  const safeRunId = input.runId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  const homeDir = await fs12.mkdtemp(path14.join(os11.tmpdir(), `paperclip-agy-mcp-${safeRunId}-`));
+  await fs12.chmod(homeDir, 448);
+  try {
+    const sourceGemini = path14.join(input.sourceHome, ".gemini");
+    const sourceAntigravityCli = path14.join(sourceGemini, "antigravity-cli");
+    const sourceConfig = path14.join(sourceGemini, "config");
+    const sourceMcpConfig = path14.join(sourceConfig, "mcp_config.json");
+    const targetGemini = path14.join(homeDir, ".gemini");
+    const targetConfig = path14.join(targetGemini, "config");
+    await fs12.mkdir(sourceAntigravityCli, { recursive: true, mode: 448 });
+    await fs12.chmod(sourceAntigravityCli, 448);
+    await symlinkEntries(input.sourceHome, homeDir, /* @__PURE__ */ new Set([".gemini"]));
+    await fs12.mkdir(targetConfig, { recursive: true });
+    await symlinkEntries(sourceGemini, targetGemini, /* @__PURE__ */ new Set(["config"]));
+    await symlinkEntries(
+      sourceConfig,
+      targetConfig,
+      /* @__PURE__ */ new Set(["mcp_config.json"])
+    );
+    const existingMcpConfig = await readAgyMcpConfig(sourceMcpConfig);
+    await fs12.writeFile(
+      path14.join(targetConfig, "mcp_config.json"),
+      `${JSON.stringify(buildAgyMcpConfig(input.servers, existingMcpConfig), null, 2)}
+`,
+      { encoding: "utf8", mode: 384 }
+    );
+    return {
+      homeDir,
+      cleanup: async () => {
+        await fs12.rm(homeDir, { recursive: true, force: true });
+      }
+    };
+  } catch (error) {
+    await fs12.rm(homeDir, { recursive: true, force: true }).catch(() => {
+    });
+    throw error;
+  }
 }
 async function discoverAgySessionArtifacts(sessionId) {
   if (!sessionId || typeof sessionId !== "string") return [];
@@ -6044,6 +6272,7 @@ async function execute(ctx) {
   const disableSlashCommands = Boolean(config.disableSlashCommands);
   const inputFormat = asString(config.inputFormat, "stream-json").trim().toLowerCase();
   const useStreamJsonInput = inputFormat !== "text";
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceSource = asString(workspaceContext.source, "");
@@ -6162,11 +6391,6 @@ async function execute(ctx) {
     cwd,
     runtimeEnv
   );
-  const loggedEnv = buildInvocationEnvForLogs(env, {
-    runtimeEnv,
-    includeRuntimeKeys: ["HOME", "PATH"],
-    resolvedCommand
-  });
   const extraArgs = (() => {
     const fromExtraArgs = asStringArray(config.extraArgs);
     if (fromExtraArgs.length > 0) return fromExtraArgs;
@@ -6311,44 +6535,78 @@ The above agent instructions were loaded from ${resolvedInstructionsFilePath}. R
     }
     return args;
   };
+  if (runtimeMcpServers.length > 0 && executionTargetIsRemote) {
+    await onLog(
+      "stdout",
+      `[paperclip] ${runtimeMcpServers.length} runtime MCP server(s) are available but cannot be injected into a remote agy execution target yet.
+`
+    );
+  }
   const runAttempt = async (resumeSessionId) => {
     const args = buildArgs(resumeSessionId);
-    if (onMeta) {
-      await onMeta({
-        adapterType: "agy_local",
-        command: resolvedCommand,
-        cwd: effectiveExecutionCwd,
-        commandArgs: args.map((arg) => arg === prompt ? `<prompt ${prompt.length} chars>` : arg),
-        env: loggedEnv,
-        prompt,
-        promptMetrics,
-        context
+    let attemptRuntimeEnv = runtimeEnv;
+    let cleanupRuntimeMcpHome = null;
+    if (runtimeMcpServers.length > 0 && !executionTargetIsRemote) {
+      const isolatedHome = await prepareAgyRuntimeMcpHome({
+        runId,
+        sourceHome: runtimeEnv.HOME || os11.homedir(),
+        servers: runtimeMcpServers
       });
+      attemptRuntimeEnv = { ...runtimeEnv, HOME: isolatedHome.homeDir };
+      cleanupRuntimeMcpHome = isolatedHome.cleanup;
     }
-    const stdin = useStreamJsonInput ? JSON.stringify({ event: "user", message: { content: prompt } }) + "\n" : void 0;
-    const proc = await runAdapterExecutionTargetProcess(
-      runId,
-      runtimeExecutionTarget,
-      command,
-      args,
-      {
-        cwd,
-        env: runtimeEnv,
-        stdin,
-        timeoutSec,
-        graceSec,
-        onSpawn,
-        onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog
+    try {
+      if (cleanupRuntimeMcpHome) {
+        await onLog(
+          "stdout",
+          `[paperclip] Injected ${runtimeMcpServers.length} run-scoped MCP server(s) into Antigravity.
+`
+        );
       }
-    );
-    return {
-      proc,
-      rawStderr: proc.stderr,
-      parsed: parseAgyJsonl(proc.stdout)
-    };
+      const attemptLoggedEnv = buildInvocationEnvForLogs(env, {
+        runtimeEnv: attemptRuntimeEnv,
+        includeRuntimeKeys: ["HOME", "PATH"],
+        resolvedCommand
+      });
+      if (onMeta) {
+        await onMeta({
+          adapterType: "agy_local",
+          command: resolvedCommand,
+          cwd: effectiveExecutionCwd,
+          commandArgs: args.map((arg) => arg === prompt ? `<prompt ${prompt.length} chars>` : arg),
+          env: attemptLoggedEnv,
+          prompt,
+          promptMetrics,
+          context
+        });
+      }
+      const stdin = useStreamJsonInput ? JSON.stringify({ event: "user", message: { content: prompt } }) + "\n" : void 0;
+      const proc = await runAdapterExecutionTargetProcess(
+        runId,
+        runtimeExecutionTarget,
+        command,
+        args,
+        {
+          cwd,
+          env: attemptRuntimeEnv,
+          stdin,
+          timeoutSec,
+          graceSec,
+          onSpawn,
+          onRuntimeProgress: ctx.onRuntimeProgress,
+          onLog
+        }
+      );
+      return {
+        proc,
+        rawStderr: proc.stderr,
+        parsed: parseAgyJsonl(proc.stdout)
+      };
+    } finally {
+      await cleanupRuntimeMcpHome?.();
+    }
   };
-  const toResult = (attempt, clearSessionOnMissingSession = false) => {
+  const toResult = (attempt, options = {}) => {
     const requiresAuth = detectAgyAuthRequired({
       stdout: attempt.proc.stdout,
       stderr: attempt.proc.stderr,
@@ -6359,18 +6617,20 @@ The above agent instructions were loaded from ${resolvedInstructionsFilePath}. R
       stderr: attempt.proc.stderr,
       parsed: attempt.parsed
     });
+    const suppressQuotaFailure = Boolean(options.suppressQuotaFailure && quotaExhausted);
     const networkUnavailable = isAgyTransientNetworkError(
       attempt.proc.stdout,
       attempt.proc.stderr
     );
     const classifyErrorCode = () => {
+      if (suppressQuotaFailure) return null;
       if (attempt.proc.errorCode) return attempt.proc.errorCode;
       if (requiresAuth) return "agy_auth_required";
       if (quotaExhausted) return "agy_quota_exhausted";
       if (networkUnavailable) return "agy_network_unavailable";
       return null;
     };
-    const errorFamily = quotaExhausted ? "provider_quota" : networkUnavailable ? "transient_upstream" : null;
+    const errorFamily = suppressQuotaFailure ? null : quotaExhausted ? "provider_quota" : networkUnavailable ? "transient_upstream" : null;
     if (attempt.proc.timedOut) {
       return {
         exitCode: attempt.proc.exitCode,
@@ -6379,10 +6639,10 @@ The above agent instructions were loaded from ${resolvedInstructionsFilePath}. R
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: classifyErrorCode(),
         errorFamily,
-        clearSession: clearSessionOnMissingSession
+        clearSession: Boolean(options.forceClearSession || options.clearSessionOnMissingSession)
       };
     }
-    const resolvedSessionId = attempt.parsed.sessionId ?? (clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
+    const resolvedSessionId = options.forceClearSession ? null : attempt.parsed.sessionId ?? (options.clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
     const resolvedSessionParams = resolvedSessionId ? {
       sessionId: resolvedSessionId,
       conversationId: resolvedSessionId,
@@ -6394,17 +6654,18 @@ The above agent instructions were loaded from ${resolvedInstructionsFilePath}. R
         remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget)
       } : {}
     } : null;
-    const outcome = resolveAgyRunOutcome(attempt.parsed, attempt.proc.exitCode);
+    const outcome = suppressQuotaFailure ? { failed: false, errorMessage: null, permissionDenied: false } : resolveAgyRunOutcome(attempt.parsed, attempt.proc.exitCode);
     const outcomeError = outcome.errorMessage?.trim() ?? "";
     const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
     const rawExitCode = attempt.proc.exitCode;
-    const synthesizedExitCode = outcome.failed && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+    const synthesizedExitCode = suppressQuotaFailure ? 0 : outcome.failed && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
     const fallbackErrorMessage = outcomeError || stderrLine || `Antigravity exited with code ${synthesizedExitCode ?? -1}`;
     const failed = outcome.failed;
+    const finalResponseText = failed ? "" : (attempt.parsed.response ?? "").trim();
     const provider = inferModelProvider(model);
     return {
       exitCode: synthesizedExitCode,
-      signal: attempt.proc.signal,
+      signal: suppressQuotaFailure ? null : attempt.proc.signal,
       timedOut: false,
       errorMessage: failed ? fallbackErrorMessage : null,
       errorCode: failed ? outcome.permissionDenied ? "agy_permission_denied" : classifyErrorCode() : null,
@@ -6429,15 +6690,26 @@ The above agent instructions were loaded from ${resolvedInstructionsFilePath}. R
         ...attempt.parsed.resultJson ? attempt.parsed.resultJson : {},
         ...attempt.parsed.thinkingTokens !== null ? { thinking_tokens: attempt.parsed.thinkingTokens } : {},
         ...attempt.parsed.tools.length > 0 ? { tool_invocations: attempt.parsed.tools.map((t) => t.name) } : {},
-        ...attempt.parsed.malformedLines > 0 ? { malformed_stream_lines: attempt.parsed.malformedLines } : {}
+        ...attempt.parsed.malformedLines > 0 ? { malformed_stream_lines: attempt.parsed.malformedLines } : {},
+        ...finalResponseText ? { finalResponseDisposition: "final", finalResponseText } : {},
+        ...suppressQuotaFailure ? { stale_quota_error_suppressed: true } : {}
       },
       summary: attempt.parsed.summary || (failed ? fallbackErrorMessage : null),
-      clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId)
+      clearSession: Boolean(
+        options.forceClearSession || options.clearSessionOnMissingSession && !attempt.parsed.sessionId
+      )
     };
   };
   const initial = await runAttempt(sessionId);
-  const initialFailed = !initial.proc.timedOut && resolveAgyRunOutcome(initial.parsed, initial.proc.exitCode).failed;
+  const initialOutcome = resolveAgyRunOutcome(initial.parsed, initial.proc.exitCode);
+  const initialFailed = !initial.proc.timedOut && initialOutcome.failed;
+  const initialQuotaExhausted = detectAgyQuotaExhausted({
+    stdout: initial.proc.stdout,
+    stderr: initial.proc.stderr,
+    parsed: initial.parsed
+  });
   let finalAttempt = initial;
+  let finalAttemptResumed = Boolean(sessionId);
   let finalResult;
   if (sessionId && initialFailed && (isAgyUnknownSessionError({
     stdout: initial.proc.stdout,
@@ -6451,13 +6723,114 @@ The above agent instructions were loaded from ${resolvedInstructionsFilePath}. R
     );
     const retry = await runAttempt(null);
     finalAttempt = retry;
-    finalResult = toResult(retry, true);
+    finalAttemptResumed = false;
+    const retryQuotaExhausted = detectAgyQuotaExhausted({
+      stdout: retry.proc.stdout,
+      stderr: retry.proc.stderr,
+      parsed: retry.parsed
+    });
+    finalResult = toResult(retry, {
+      clearSessionOnMissingSession: true,
+      forceClearSession: retryQuotaExhausted
+    });
+  } else if (sessionId && initialFailed && initialQuotaExhausted) {
+    const historicalQuotaError = isHistoricalQuotaResumeResult({
+      resumedSession: true,
+      parsed: initial.parsed,
+      exitCode: initial.proc.exitCode,
+      stderr: initial.proc.stderr
+    });
+    const hasToolActivity = initial.parsed.tools.length > 0;
+    if (historicalQuotaError) {
+      await onLog(
+        "stdout",
+        "[paperclip] Ignored a historical quota error attached to a completed resumed Antigravity turn; clearing the poisoned conversation before the next run (google-antigravity/antigravity-cli#1048).\n"
+      );
+      finalResult = toResult(initial, {
+        suppressQuotaFailure: true,
+        forceClearSession: true
+      });
+      finalResult.resultJson = {
+        ...finalResult.resultJson,
+        historical_quota_error: initial.parsed.errorMessage
+      };
+    } else if (!hasToolActivity) {
+      await onLog(
+        "stdout",
+        "[paperclip] Resumed Antigravity conversation reported quota before doing work; retrying once with a fresh conversation.\n"
+      );
+      const retry = await runAttempt(null);
+      finalAttempt = retry;
+      finalAttemptResumed = false;
+      const retryQuotaExhausted = detectAgyQuotaExhausted({
+        stdout: retry.proc.stdout,
+        stderr: retry.proc.stderr,
+        parsed: retry.parsed
+      });
+      finalResult = toResult(retry, {
+        forceClearSession: retryQuotaExhausted
+      });
+    } else {
+      await onLog(
+        "stdout",
+        "[paperclip] Resumed Antigravity conversation hit quota after tool activity; not replaying potentially mutating work. The conversation will be cleared for the next run.\n"
+      );
+      finalResult = toResult(initial, { forceClearSession: true });
+    }
   } else {
     finalResult = toResult(initial);
   }
   if (finalAttempt.parsed.deniedActions.length > 0) {
     await onLog("stdout", `[paperclip] ${describeAgyDeniedActions(finalAttempt.parsed.deniedActions)}
 `);
+  }
+  const rawUsage = finalAttempt.parsed.usage;
+  if (rawUsage && finalResult.usage) {
+    const previousUsage = readUsageSnapshot(
+      runtimeSessionParams.usageTotals ?? runtimeSessionParams.usage_totals
+    );
+    let normalizedUsage = finalResult.usage;
+    let usageBasis = "per_run";
+    let shouldRecordLocalQuota = true;
+    if (finalAttemptResumed) {
+      if (previousUsage) {
+        normalizedUsage = deriveUsageDelta(finalResult.usage, previousUsage);
+      } else if (finalResult.sessionId) {
+        usageBasis = "session_cumulative";
+        shouldRecordLocalQuota = false;
+      } else {
+        finalResult.usage = void 0;
+        finalResult.usageBasis = void 0;
+        finalResult.costUsd = null;
+        shouldRecordLocalQuota = false;
+        finalResult.resultJson = {
+          ...finalResult.resultJson,
+          usage_omitted_for_cleared_legacy_session: true
+        };
+      }
+    }
+    if (finalResult.usage) {
+      finalResult.usage = normalizedUsage;
+      finalResult.usageBasis = usageBasis;
+      finalResult.costUsd = usageBasis === "per_run" ? estimateAgyModelCostUsd(model, normalizedUsage) : null;
+    }
+    if (finalResult.sessionParams) {
+      finalResult.sessionParams = {
+        ...finalResult.sessionParams,
+        usageTotals: {
+          inputTokens: rawUsage.inputTokens ?? 0,
+          outputTokens: rawUsage.outputTokens ?? 0,
+          cachedInputTokens: rawUsage.cachedInputTokens ?? 0
+        }
+      };
+    }
+    if (shouldRecordLocalQuota) {
+      const totalTokens = (normalizedUsage.inputTokens || 0) + (normalizedUsage.outputTokens || 0);
+      if (totalTokens > 0) {
+        await recordAgyRunUsage(totalTokens, model).catch(() => {
+        });
+      }
+    }
   }
   if (finalResult.sessionId && !executionTargetIsRemote) {
     const artifacts = await discoverAgySessionArtifacts(finalResult.sessionId);
@@ -6472,13 +6845,6 @@ ${artifacts.map((a) => `  - ${a}`).join("\n")}
         ...finalResult.resultJson,
         artifacts
       };
-    }
-  }
-  if (finalResult.usage) {
-    const totalTokens = (finalResult.usage.inputTokens || 0) + (finalResult.usage.outputTokens || 0);
-    if (totalTokens > 0) {
-      await recordAgyRunUsage(totalTokens, model).catch(() => {
-      });
     }
   }
   return finalResult;
@@ -6826,6 +7192,30 @@ function getConfigSchema() {
 }
 
 // src/server/index.ts
+function readUsageTotals(value) {
+  const obj = parseObject(value);
+  if (Object.keys(obj).length === 0) return null;
+  const tokenKeys = [
+    "inputTokens",
+    "input_tokens",
+    "outputTokens",
+    "output_tokens",
+    "cachedInputTokens",
+    "cache_read_tokens"
+  ];
+  const hasRecognizedField = tokenKeys.some(
+    (key) => Object.prototype.hasOwnProperty.call(obj, key)
+  );
+  const hasInvalidRecognizedField = tokenKeys.some(
+    (key) => Object.prototype.hasOwnProperty.call(obj, key) && (typeof obj[key] !== "number" || !Number.isFinite(obj[key]))
+  );
+  if (!hasRecognizedField || hasInvalidRecognizedField) return null;
+  return {
+    inputTokens: asNumber(obj.inputTokens ?? obj.input_tokens, 0),
+    outputTokens: asNumber(obj.outputTokens ?? obj.output_tokens, 0),
+    cachedInputTokens: asNumber(obj.cachedInputTokens ?? obj.cache_read_tokens, 0)
+  };
+}
 var sessionCodec = {
   deserialize(raw) {
     if (typeof raw === "string" && raw.trim().length > 0) {
@@ -6840,13 +7230,15 @@ var sessionCodec = {
     const repoUrl = asString(obj.repoUrl, "") || asString(obj.repo_url, "");
     const repoRef = asString(obj.repoRef, "") || asString(obj.repo_ref, "");
     const remoteExecution = typeof obj.remoteExecution === "object" && obj.remoteExecution !== null && !Array.isArray(obj.remoteExecution) ? { ...obj.remoteExecution } : null;
+    const usageTotals = readUsageTotals(obj.usageTotals ?? obj.usage_totals);
     return {
       sessionId,
       ...cwd ? { cwd } : {},
       ...workspaceId ? { workspaceId } : {},
       ...repoUrl ? { repoUrl } : {},
       ...repoRef ? { repoRef } : {},
-      ...remoteExecution ? { remoteExecution } : {}
+      ...remoteExecution ? { remoteExecution } : {},
+      ...usageTotals ? { usageTotals } : {}
     };
   },
   serialize(params) {
@@ -6858,13 +7250,15 @@ var sessionCodec = {
     const repoUrl = asString(params.repoUrl, "") || asString(params.repo_url, "");
     const repoRef = asString(params.repoRef, "") || asString(params.repo_ref, "");
     const remoteExecution = typeof params.remoteExecution === "object" && params.remoteExecution !== null && !Array.isArray(params.remoteExecution) ? { ...params.remoteExecution } : null;
+    const usageTotals = readUsageTotals(params.usageTotals ?? params.usage_totals);
     return {
       sessionId,
       ...cwd ? { cwd } : {},
       ...workspaceId ? { workspaceId } : {},
       ...repoUrl ? { repoUrl } : {},
       ...repoRef ? { repoRef } : {},
-      ...remoteExecution ? { remoteExecution } : {}
+      ...remoteExecution ? { remoteExecution } : {},
+      ...usageTotals ? { usageTotals } : {}
     };
   },
   getDisplayId(params) {

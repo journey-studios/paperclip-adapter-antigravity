@@ -460,6 +460,13 @@ export interface ServerAdapterModule {
   sessionCodec?: AdapterSessionCodec;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
   supportsLocalAgentJwt?: boolean;
+  /**
+   * Lets an operator retry one failed run through the explicit retry action even
+   * though the adapter is not a conversation adapter. The retry starts a fresh
+   * session (previousRunId, forceFreshSession); it never resumes the failed
+   * session, and it does not change how other failures or comments are recovered.
+   */
+  supportsExplicitRetry?: boolean;
   /** How this adapter receives Paperclip's run-scoped control tools. */
   runtimeToolDelivery?: AdapterRuntimeToolDelivery;
   models?: AdapterModel[];
