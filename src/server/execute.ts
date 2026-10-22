@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionContext, AdapterExecutionResult, AdapterRuntimeMcpServer, UsageSummary } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -40,6 +40,7 @@ import {
 import {
   describeAgyDeniedActions,
   detectAgyAuthRequired,
+  estimateAgyModelCostUsd,
   detectAgyQuotaExhausted,
   isAgySessionUnrecoverableError,
   isAgyTransientNetworkError,
@@ -71,6 +72,73 @@ function firstNonEmptyLine(text: string): string {
 }
 
 /**
+ * Work around google-antigravity/antigravity-cli#1048.
+ *
+ * On resume, agy can finish the current turn successfully and then attach a
+ * quota error copied from an older turn to the terminal result. A genuine
+ * current-turn quota failure emits an error_message step and does not complete
+ * an assistant response. Keep the guard deliberately strict so real 429s are
+ * never converted into success.
+ */
+export function isHistoricalQuotaResumeResult(input: {
+  resumedSession: boolean;
+  parsed: ParsedAgyOutput;
+  exitCode: number | null;
+  stderr: string;
+}): boolean {
+  if (!input.resumedSession || (input.exitCode ?? 0) !== 0 || input.stderr.trim()) return false;
+  if (!input.parsed.completedAssistantResponse || input.parsed.sawErrorStep) return false;
+
+  const response = (input.parsed.response ?? "").trim();
+  const streamed = input.parsed.assistantText.trim();
+  if (!response || !streamed || response !== streamed) return false;
+
+  return detectAgyQuotaExhausted({ parsed: input.parsed });
+}
+
+function readUsageSnapshot(value: unknown): UsageSummary | null {
+  const obj = parseObject(value);
+  if (Object.keys(obj).length === 0) return null;
+
+  const tokenKeys = [
+    "inputTokens",
+    "input_tokens",
+    "outputTokens",
+    "output_tokens",
+    "cachedInputTokens",
+    "cache_read_tokens",
+  ];
+  const hasRecognizedField = tokenKeys.some((key) =>
+    Object.prototype.hasOwnProperty.call(obj, key),
+  );
+  const hasInvalidRecognizedField = tokenKeys.some(
+    (key) =>
+      Object.prototype.hasOwnProperty.call(obj, key) &&
+      (typeof obj[key] !== "number" || !Number.isFinite(obj[key])),
+  );
+  if (!hasRecognizedField || hasInvalidRecognizedField) return null;
+
+  return {
+    inputTokens: asNumber(obj.inputTokens ?? obj.input_tokens, 0),
+    outputTokens: asNumber(obj.outputTokens ?? obj.output_tokens, 0),
+    cachedInputTokens: asNumber(obj.cachedInputTokens ?? obj.cache_read_tokens, 0),
+  };
+}
+
+function deriveUsageDelta(current: UsageSummary, previous: UsageSummary): UsageSummary {
+  const delta = (now: number | undefined, before: number | undefined) => {
+    const currentValue = now ?? 0;
+    const previousValue = before ?? 0;
+    return currentValue >= previousValue ? currentValue - previousValue : currentValue;
+  };
+  return {
+    inputTokens: delta(current.inputTokens, previous.inputTokens),
+    outputTokens: delta(current.outputTokens, previous.outputTokens),
+    cachedInputTokens: delta(current.cachedInputTokens, previous.cachedInputTokens),
+  };
+}
+
+/**
  * Detect whether a model ID already includes a reasoning effort tier suffix.
  * agy rejects --model plus --effort together when the model already specifies effort.
  */
@@ -86,6 +154,121 @@ export function resolveAgyPrintTimeoutSec(timeoutSec: number): number {
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) return 0;
   const margin = Math.max(10, Math.floor(timeoutSec * 0.05));
   return Math.max(30, timeoutSec - margin);
+}
+
+function recordOrEmpty(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+export function buildAgyMcpConfig(
+  servers: AdapterRuntimeMcpServer[],
+  existingConfig: unknown = {},
+): Record<string, unknown> {
+  const existing = recordOrEmpty(existingConfig);
+  const existingServers = recordOrEmpty(existing.mcpServers);
+  const mcpServers: Record<string, unknown> = { ...existingServers };
+  const usedNames = new Set<string>(Object.keys(existingServers));
+
+  for (const server of servers) {
+    const baseName = server.name.trim() || server.connectionId.trim() || "paperclip";
+    let name = baseName;
+    let suffix = 2;
+    while (usedNames.has(name)) {
+      name = `${baseName}-${suffix}`;
+      suffix += 1;
+    }
+    usedNames.add(name);
+    mcpServers[name] = {
+      disabled: false,
+      headers: { Authorization: `Bearer ${server.token}` },
+      serverUrl: server.url,
+    };
+  }
+
+  return { ...existing, mcpServers };
+}
+
+async function readAgyMcpConfig(filePath: string): Promise<Record<string, unknown>> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`Antigravity MCP config at ${filePath} must be a JSON object.`);
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+async function symlinkEntries(
+  sourceDir: string,
+  targetDir: string,
+  excludedNames: Set<string> = new Set(),
+): Promise<void> {
+  const entries = await fs.readdir(sourceDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (excludedNames.has(entry.name)) continue;
+    const source = path.join(sourceDir, entry.name);
+    const target = path.join(targetDir, entry.name);
+    await fs.symlink(source, target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    });
+  }
+}
+
+async function prepareAgyRuntimeMcpHome(input: {
+  runId: string;
+  sourceHome: string;
+  servers: AdapterRuntimeMcpServer[];
+}): Promise<{ homeDir: string; cleanup: () => Promise<void> }> {
+  const safeRunId = input.runId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-agy-mcp-${safeRunId}-`));
+  await fs.chmod(homeDir, 0o700);
+
+  try {
+    const sourceGemini = path.join(input.sourceHome, ".gemini");
+    const sourceAntigravityCli = path.join(sourceGemini, "antigravity-cli");
+    const sourceConfig = path.join(sourceGemini, "config");
+    const sourceMcpConfig = path.join(sourceConfig, "mcp_config.json");
+    const targetGemini = path.join(homeDir, ".gemini");
+    const targetConfig = path.join(targetGemini, "config");
+
+    // Ensure CLI state created during this attempt (sessions, brain artifacts,
+    // logs, etc.) lands in the persistent HOME even on a first Antigravity run.
+    await fs.mkdir(sourceAntigravityCli, { recursive: true, mode: 0o700 });
+    await fs.chmod(sourceAntigravityCli, 0o700);
+
+    await symlinkEntries(input.sourceHome, homeDir, new Set([".gemini"]));
+    await fs.mkdir(targetConfig, { recursive: true });
+
+    await symlinkEntries(sourceGemini, targetGemini, new Set(["config"]));
+    await symlinkEntries(
+      sourceConfig,
+      targetConfig,
+      new Set(["mcp_config.json"]),
+    );
+
+    const existingMcpConfig = await readAgyMcpConfig(sourceMcpConfig);
+    await fs.writeFile(
+      path.join(targetConfig, "mcp_config.json"),
+      `${JSON.stringify(buildAgyMcpConfig(input.servers, existingMcpConfig), null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    return {
+      homeDir,
+      cleanup: async () => {
+        await fs.rm(homeDir, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await fs.rm(homeDir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 export async function discoverAgySessionArtifacts(sessionId: string): Promise<string[]> {
@@ -155,6 +338,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const disableSlashCommands = Boolean(config.disableSlashCommands);
   const inputFormat = asString(config.inputFormat, "stream-json").trim().toLowerCase();
   const useStreamJsonInput = inputFormat !== "text";
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -304,12 +488,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     cwd,
     runtimeEnv,
   );
-
-  const loggedEnv = buildInvocationEnvForLogs(env, {
-    runtimeEnv,
-    includeRuntimeKeys: ["HOME", "PATH"],
-    resolvedCommand,
-  });
 
   const extraArgs = (() => {
     const fromExtraArgs = asStringArray(config.extraArgs);
@@ -476,54 +654,97 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return args;
   };
 
+  if (runtimeMcpServers.length > 0 && executionTargetIsRemote) {
+    await onLog(
+      "stdout",
+      `[paperclip] ${runtimeMcpServers.length} runtime MCP server(s) are available but cannot be injected into a remote agy execution target yet.\n`,
+    );
+  }
+
   const runAttempt = async (resumeSessionId: string | null) => {
     const args = buildArgs(resumeSessionId);
-    if (onMeta) {
-      await onMeta({
-        adapterType: "agy_local",
-        command: resolvedCommand,
-        cwd: effectiveExecutionCwd,
-        commandArgs: args.map((arg) => (arg === prompt ? `<prompt ${prompt.length} chars>` : arg)),
-        env: loggedEnv,
-        prompt,
-        promptMetrics,
-        context,
+    let attemptRuntimeEnv = runtimeEnv;
+    let cleanupRuntimeMcpHome: (() => Promise<void>) | null = null;
+
+    if (runtimeMcpServers.length > 0 && !executionTargetIsRemote) {
+      const isolatedHome = await prepareAgyRuntimeMcpHome({
+        runId,
+        sourceHome: runtimeEnv.HOME || os.homedir(),
+        servers: runtimeMcpServers,
       });
+      attemptRuntimeEnv = { ...runtimeEnv, HOME: isolatedHome.homeDir };
+      cleanupRuntimeMcpHome = isolatedHome.cleanup;
     }
 
-    const stdin = useStreamJsonInput
-      ? JSON.stringify({ event: "user", message: { content: prompt } }) + "\n"
-      : undefined;
+    try {
+      if (cleanupRuntimeMcpHome) {
+        await onLog(
+          "stdout",
+          `[paperclip] Injected ${runtimeMcpServers.length} run-scoped MCP server(s) into Antigravity.\n`,
+        );
+      }
 
-    const proc = await runAdapterExecutionTargetProcess(
-      runId,
-      runtimeExecutionTarget,
-      command,
-      args,
-      {
-        cwd,
-        env: runtimeEnv,
-        stdin,
-        timeoutSec,
-        graceSec,
-        onSpawn,
-        onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog,
-      },
-    );
+      const attemptLoggedEnv = buildInvocationEnvForLogs(env, {
+        runtimeEnv: attemptRuntimeEnv,
+        includeRuntimeKeys: ["HOME", "PATH"],
+        resolvedCommand,
+      });
 
-    return {
-      proc,
-      rawStderr: proc.stderr,
-      parsed: parseAgyJsonl(proc.stdout),
-    };
+      if (onMeta) {
+        await onMeta({
+          adapterType: "agy_local",
+          command: resolvedCommand,
+          cwd: effectiveExecutionCwd,
+          commandArgs: args.map((arg) => (arg === prompt ? `<prompt ${prompt.length} chars>` : arg)),
+          env: attemptLoggedEnv,
+          prompt,
+          promptMetrics,
+          context,
+        });
+      }
+
+      const stdin = useStreamJsonInput
+        ? JSON.stringify({ event: "user", message: { content: prompt } }) + "\n"
+        : undefined;
+
+      const proc = await runAdapterExecutionTargetProcess(
+        runId,
+        runtimeExecutionTarget,
+        command,
+        args,
+        {
+          cwd,
+          env: attemptRuntimeEnv,
+          stdin,
+          timeoutSec,
+          graceSec,
+          onSpawn,
+          onRuntimeProgress: ctx.onRuntimeProgress,
+          onLog,
+        },
+      );
+
+      return {
+        proc,
+        rawStderr: proc.stderr,
+        parsed: parseAgyJsonl(proc.stdout),
+      };
+    } finally {
+      await cleanupRuntimeMcpHome?.();
+    }
   };
 
   type Attempt = Awaited<ReturnType<typeof runAttempt>>;
 
+  type ResultOptions = {
+    clearSessionOnMissingSession?: boolean;
+    suppressQuotaFailure?: boolean;
+    forceClearSession?: boolean;
+  };
+
   const toResult = (
     attempt: Attempt,
-    clearSessionOnMissingSession = false,
+    options: ResultOptions = {},
   ): AdapterExecutionResult => {
     const requiresAuth = detectAgyAuthRequired({
       stdout: attempt.proc.stdout,
@@ -535,12 +756,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stderr: attempt.proc.stderr,
       parsed: attempt.parsed,
     });
+    const suppressQuotaFailure = Boolean(options.suppressQuotaFailure && quotaExhausted);
     const networkUnavailable = isAgyTransientNetworkError(
       attempt.proc.stdout,
       attempt.proc.stderr,
     );
 
     const classifyErrorCode = (): string | null => {
+      if (suppressQuotaFailure) return null;
       if (attempt.proc.errorCode) return attempt.proc.errorCode;
       if (requiresAuth) return "agy_auth_required";
       if (quotaExhausted) return "agy_quota_exhausted";
@@ -548,11 +771,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return null;
     };
 
-    const errorFamily = quotaExhausted
-      ? ("provider_quota" as const)
-      : networkUnavailable
-        ? ("transient_upstream" as const)
-        : null;
+    const errorFamily = suppressQuotaFailure
+      ? null
+      : quotaExhausted
+        ? ("provider_quota" as const)
+        : networkUnavailable
+          ? ("transient_upstream" as const)
+          : null;
 
     if (attempt.proc.timedOut) {
       return {
@@ -562,13 +787,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: classifyErrorCode(),
         errorFamily,
-        clearSession: clearSessionOnMissingSession,
+        clearSession: Boolean(options.forceClearSession || options.clearSessionOnMissingSession),
       };
     }
 
-    const resolvedSessionId =
-      attempt.parsed.sessionId ??
-      (clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
+    const resolvedSessionId = options.forceClearSession
+      ? null
+      : attempt.parsed.sessionId ??
+        (options.clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
     const resolvedSessionParams = resolvedSessionId
       ? ({
           sessionId: resolvedSessionId,
@@ -585,11 +811,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         } as Record<string, unknown>)
       : null;
 
-    const outcome = resolveAgyRunOutcome(attempt.parsed, attempt.proc.exitCode);
+    const outcome = suppressQuotaFailure
+      ? { failed: false, errorMessage: null, permissionDenied: false }
+      : resolveAgyRunOutcome(attempt.parsed, attempt.proc.exitCode);
     const outcomeError = outcome.errorMessage?.trim() ?? "";
     const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
     const rawExitCode = attempt.proc.exitCode;
-    const synthesizedExitCode = outcome.failed && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+    const synthesizedExitCode = suppressQuotaFailure
+      ? 0
+      : outcome.failed && (rawExitCode ?? 0) === 0
+        ? 1
+        : rawExitCode;
     const fallbackErrorMessage =
       outcomeError || stderrLine || `Antigravity exited with code ${synthesizedExitCode ?? -1}`;
     const failed = outcome.failed;
@@ -603,7 +835,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     return {
       exitCode: synthesizedExitCode,
-      signal: attempt.proc.signal,
+      signal: suppressQuotaFailure ? null : attempt.proc.signal,
       timedOut: false,
       errorMessage: failed ? fallbackErrorMessage : null,
       errorCode: failed
@@ -644,18 +876,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(finalResponseText
           ? { finalResponseDisposition: "final", finalResponseText }
           : {}),
+        ...(suppressQuotaFailure ? { stale_quota_error_suppressed: true } : {}),
       },
       summary: attempt.parsed.summary || (failed ? fallbackErrorMessage : null),
-      clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
+      clearSession: Boolean(
+        options.forceClearSession ||
+          (options.clearSessionOnMissingSession && !attempt.parsed.sessionId),
+      ),
     };
   };
 
   const initial = await runAttempt(sessionId);
-  const initialFailed =
-    !initial.proc.timedOut && resolveAgyRunOutcome(initial.parsed, initial.proc.exitCode).failed;
+  const initialOutcome = resolveAgyRunOutcome(initial.parsed, initial.proc.exitCode);
+  const initialFailed = !initial.proc.timedOut && initialOutcome.failed;
+  const initialQuotaExhausted = detectAgyQuotaExhausted({
+    stdout: initial.proc.stdout,
+    stderr: initial.proc.stderr,
+    parsed: initial.parsed,
+  });
 
   let finalAttempt: Attempt = initial;
+  let finalAttemptResumed = Boolean(sessionId);
   let finalResult: AdapterExecutionResult;
+
   if (
     sessionId &&
     initialFailed &&
@@ -672,13 +915,127 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
     const retry = await runAttempt(null);
     finalAttempt = retry;
-    finalResult = toResult(retry, true);
+    finalAttemptResumed = false;
+    const retryQuotaExhausted = detectAgyQuotaExhausted({
+      stdout: retry.proc.stdout,
+      stderr: retry.proc.stderr,
+      parsed: retry.parsed,
+    });
+    finalResult = toResult(retry, {
+      clearSessionOnMissingSession: true,
+      forceClearSession: retryQuotaExhausted,
+    });
+  } else if (sessionId && initialFailed && initialQuotaExhausted) {
+    const historicalQuotaError = isHistoricalQuotaResumeResult({
+      resumedSession: true,
+      parsed: initial.parsed,
+      exitCode: initial.proc.exitCode,
+      stderr: initial.proc.stderr,
+    });
+    const hasToolActivity = initial.parsed.tools.length > 0;
+
+    if (historicalQuotaError) {
+      await onLog(
+        "stdout",
+        "[paperclip] Ignored a historical quota error attached to a completed resumed Antigravity turn; clearing the poisoned conversation before the next run (google-antigravity/antigravity-cli#1048).\n",
+      );
+      finalResult = toResult(initial, {
+        suppressQuotaFailure: true,
+        forceClearSession: true,
+      });
+      finalResult.resultJson = {
+        ...(finalResult.resultJson as Record<string, unknown> | undefined),
+        historical_quota_error: initial.parsed.errorMessage,
+      };
+    } else if (!hasToolActivity) {
+      await onLog(
+        "stdout",
+        "[paperclip] Resumed Antigravity conversation reported quota before doing work; retrying once with a fresh conversation.\n",
+      );
+      const retry = await runAttempt(null);
+      finalAttempt = retry;
+      finalAttemptResumed = false;
+      const retryQuotaExhausted = detectAgyQuotaExhausted({
+        stdout: retry.proc.stdout,
+        stderr: retry.proc.stderr,
+        parsed: retry.parsed,
+      });
+      finalResult = toResult(retry, {
+        forceClearSession: retryQuotaExhausted,
+      });
+    } else {
+      await onLog(
+        "stdout",
+        "[paperclip] Resumed Antigravity conversation hit quota after tool activity; not replaying potentially mutating work. The conversation will be cleared for the next run.\n",
+      );
+      finalResult = toResult(initial, { forceClearSession: true });
+    }
   } else {
     finalResult = toResult(initial);
   }
 
   if (finalAttempt.parsed.deniedActions.length > 0) {
     await onLog("stdout", `[paperclip] ${describeAgyDeniedActions(finalAttempt.parsed.deniedActions)}\n`);
+  }
+
+  const rawUsage = finalAttempt.parsed.usage;
+  if (rawUsage && finalResult.usage) {
+    const previousUsage = readUsageSnapshot(
+      runtimeSessionParams.usageTotals ?? runtimeSessionParams.usage_totals,
+    );
+    let normalizedUsage = finalResult.usage;
+    let usageBasis: "per_run" | "session_cumulative" = "per_run";
+    let shouldRecordLocalQuota = true;
+
+    if (finalAttemptResumed) {
+      if (previousUsage) {
+        normalizedUsage = deriveUsageDelta(finalResult.usage, previousUsage);
+      } else if (finalResult.sessionId) {
+        // Older persisted sessions do not have a usage baseline. Let Paperclip
+        // derive the delta from the previous run instead of double-counting the
+        // conversation total. The next heartbeat will have a local baseline.
+        usageBasis = "session_cumulative";
+        shouldRecordLocalQuota = false;
+      } else {
+        // A poisoned legacy session is being cleared and Paperclip can no longer
+        // associate cumulative usage with that session to derive a delta safely.
+        // Prefer one unmetered run over knowingly double-counting the whole session.
+        finalResult.usage = undefined;
+        finalResult.usageBasis = undefined;
+        finalResult.costUsd = null;
+        shouldRecordLocalQuota = false;
+        finalResult.resultJson = {
+          ...(finalResult.resultJson as Record<string, unknown> | undefined),
+          usage_omitted_for_cleared_legacy_session: true,
+        };
+      }
+    }
+
+    if (finalResult.usage) {
+      finalResult.usage = normalizedUsage;
+      finalResult.usageBasis = usageBasis;
+      finalResult.costUsd =
+        usageBasis === "per_run" ? estimateAgyModelCostUsd(model, normalizedUsage) : null;
+    }
+
+    if (finalResult.sessionParams) {
+      finalResult.sessionParams = {
+        ...(finalResult.sessionParams as Record<string, unknown>),
+        usageTotals: {
+          inputTokens: rawUsage.inputTokens ?? 0,
+          outputTokens: rawUsage.outputTokens ?? 0,
+          cachedInputTokens: rawUsage.cachedInputTokens ?? 0,
+        },
+      };
+    }
+
+    if (shouldRecordLocalQuota) {
+      const totalTokens =
+        (normalizedUsage.inputTokens || 0) + (normalizedUsage.outputTokens || 0);
+      if (totalTokens > 0) {
+        await recordAgyRunUsage(totalTokens, model).catch(() => {});
+      }
+    }
   }
 
   if (finalResult.sessionId && !executionTargetIsRemote) {
@@ -692,13 +1049,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(finalResult.resultJson as Record<string, unknown> | undefined),
         artifacts,
       };
-    }
-  }
-
-  if (finalResult.usage) {
-    const totalTokens = (finalResult.usage.inputTokens || 0) + (finalResult.usage.outputTokens || 0);
-    if (totalTokens > 0) {
-      await recordAgyRunUsage(totalTokens, model).catch(() => {});
     }
   }
 

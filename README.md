@@ -5,7 +5,7 @@
 
 Standalone external adapter plugin for [Paperclip AI](https://github.com/paperclipai/paperclip) that integrates the Google Antigravity (`agy`) CLI runtime.
 
-Designed as an **isolated, upgrade-safe external plugin**: installs cleanly into Paperclip's persistent volume without modifying Paperclip's core codebase or Docker images, fully surviving upstream container updates (`docker compose pull`).
+Designed as an **isolated external plugin** that can be installed into Paperclip's persistent storage without embedding organization-specific infrastructure in this repository. Deployment recipes, production image overlays, backups, credentials, and environment-specific runbooks should live in private infrastructure repositories.
 
 ---
 
@@ -19,7 +19,7 @@ Designed as an **isolated, upgrade-safe external plugin**: installs cleanly into
   - Claude Sonnet: \$3.00 / 1M input, \$15.00 / 1M output
   - Claude Opus: \$15.00 / 1M input, \$75.00 / 1M output
   - GPT-OSS 120B: \$0.20 / 1M input, \$0.60 / 1M output
-- **ACP Subscription Quota Tracker**: Implements `getQuotaWindows()` with 5-hour and 7-day sliding windows, rendering live quota bars (`5h` and `Weekly`) in Paperclip's native **Costs -> Subscription Quota** card.
+- **Provider Subscription Quota**: Reads the authoritative Antigravity `/usage` command, including model-family 5-hour/weekly buckets and provider reset times. Falls back to a clearly labeled local estimate only when `/usage` is unavailable.
 - **Session Continuity**: Multi-turn conversation state persistence across heartbeats via `--conversation <id>` with automatic recovery.
 - **Live UI Parser**: Bundles a self-contained CommonJS log parser (`ui-parser.cjs`) served dynamically by Paperclip to render live streaming thought processes and tool calls in the UI.
 
@@ -68,8 +68,8 @@ Copy the package into the Paperclip persistent storage directory (e.g. `/papercl
 
 ```bash
 # Example copying to a remote VPS running Paperclip
-ssh root@<vps-ip> 'mkdir -p /paperclip/extensions/paperclip-adapter-antigravity'
-scp -r ./dist ./ui-parser.cjs ./package.json root@<vps-ip>:/paperclip/extensions/paperclip-adapter-antigravity/
+ssh <user>@<host> 'mkdir -p /paperclip/extensions/paperclip-adapter-antigravity'
+scp -r ./dist ./ui-parser.cjs ./package.json <user>@<host>:/paperclip/extensions/paperclip-adapter-antigravity/
 ```
 
 ### 3. Register in Paperclip
@@ -83,20 +83,12 @@ Add the adapter to `/paperclip/adapter-plugins.json`:
     "localPath": "/paperclip/extensions/paperclip-adapter-antigravity",
     "version": "1.0.0",
     "type": "agy_local",
-    "installedAt": "2026-10-06T12:00:00.000Z"
+    "installedAt": "2026-01-01T00:00:00.000Z"
   }
 ]
 ```
 
-### 4. Enable Quota Bars in UI (Optional / Quick Patch)
-
-Paperclip v0.3.x limits the frontend Subscription Quota card to `anthropic` and `openai` by default. To display the Google quota bars:
-
-```bash
-sh scripts/patch-ui.sh
-```
-
-### 5. Restart Paperclip
+### 4. Restart Paperclip
 
 ```bash
 docker compose restart paperclip-app
@@ -112,8 +104,8 @@ Before using this adapter, ensure your host or Docker container meets the follow
    - If running inside Docker, bind-mount the `agy` binary:
      ```yaml
      volumes:
-       - /root/.local/bin/agy:/usr/local/bin/agy:ro
-       - /root/.gemini:/paperclip/.gemini:rw
+       - /path/to/agy:/usr/local/bin/agy:ro
+       - /path/to/gemini-home:/paperclip/.gemini:rw
      ```
 2. **Google Antigravity Authentication**:
    - Log in once on your host with:
@@ -144,13 +136,16 @@ Once installed, configure any agent in Paperclip to use Antigravity:
 
 ## Environment Variables
 
-You can customize the sliding window quota thresholds via environment variables in your Paperclip `.env` or Docker Compose file:
+Provider quota comes from Antigravity `/usage`. The local fallback and probe behavior can be customized via environment variables in your Paperclip `.env` or Docker Compose file:
 
 | Variable | Default | Description |
 |---|---|---|
-| `AGY_5H_TOKEN_LIMIT` | `2000000` | Baseline token limit for the 5-hour rolling quota window. |
-| `AGY_WEEKLY_TOKEN_LIMIT` | `15000000` | Baseline token limit for the 7-day rolling quota window. |
-| `PAPERCLIP_AGY_QUOTA_FILE` | `~/.gemini/antigravity-cli/quota-history.json` | Path to persistent quota history ledger. |
+| `AGY_5H_TOKEN_LIMIT` | `2000000` | Fallback-only token limit when provider `/usage` is unavailable. |
+| `AGY_WEEKLY_TOKEN_LIMIT` | `15000000` | Fallback-only weekly limit when provider `/usage` is unavailable. |
+| `PAPERCLIP_AGY_QUOTA_FILE` | `~/.gemini/antigravity-cli/quota-history.json` | Path to the local fallback usage ledger. |
+| `PAPERCLIP_AGY_QUOTA_CACHE_MS` | `60000` | Cache duration for provider `/usage` results. |
+| `PAPERCLIP_AGY_QUOTA_TIMEOUT_MS` | `10000` | Timeout for the provider quota probe. |
+| `PAPERCLIP_AGY_COMMAND` | `agy` | Optional command/path override used by the quota probe. |
 
 ---
 

@@ -56,6 +56,8 @@ describe("parseAgyJsonl", () => {
       cachedInputTokens: 8128,
     });
     expect(parsed.thinkingTokens).toBe(86);
+    expect(parsed.completedAssistantResponse).toBe(true);
+    expect(parsed.sawErrorStep).toBe(false);
     expect(parsed.errorMessage).toBeNull();
     expect(parsed.malformedLines).toBe(0);
     expect(isAgySuccessResult(parsed)).toBe(true);
@@ -116,6 +118,18 @@ describe("parseAgyJsonl", () => {
   it("a non-SUCCESS status with no error field still explains itself", () => {
     const parsed = parseAgyJsonl('{"event":"result","result":{"status":"CANCELLED"}}');
     expect(parsed.errorMessage).toBe("agy finished with status CANCELLED");
+  });
+
+  it("distinguishes an explicit current-turn error_message from terminal history", () => {
+    const parsed = parseAgyJsonl(
+      [
+        '{"event":"init","conversation_id":"conv-quota"}',
+        '{"event":"step_update","step_update":{"conversation_id":"conv-quota","step_index":2,"state":"ERROR","step_type":"error_message","text_delta":"RESOURCE_EXHAUSTED"}}',
+        '{"event":"result","result":{"conversation_id":"conv-quota","status":"ERROR","response":"","error":"RESOURCE_EXHAUSTED: quota exceeded"}}',
+      ].join("\n"),
+    );
+    expect(parsed.sawErrorStep).toBe(true);
+    expect(parsed.completedAssistantResponse).toBe(false);
   });
 
   it("counts malformed JSON lines instead of throwing", () => {
@@ -215,6 +229,7 @@ describe("failure and session error classification", () => {
     expect(detectAgyAuthRequired({ stderr: "some other failure" }).requiresAuth).toBe(false);
 
     expect(detectAgyQuotaExhausted({ stderr: "RESOURCE_EXHAUSTED" })).toBe(true);
+    expect(detectAgyQuotaExhausted({ stderr: "Individual quota reached. Resets in 1h39m17s." })).toBe(true);
     expect(detectAgyQuotaExhausted({ stderr: "429 too many requests" })).toBe(true);
     expect(detectAgyQuotaExhausted({ stderr: "file not found" })).toBe(false);
 
