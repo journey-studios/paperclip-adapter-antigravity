@@ -45,10 +45,21 @@ function readEnvValueCaseInsensitive(env, key) {
   }
   return void 0;
 }
+function withoutInheritedControlPlaneSecrets(env, inheritedEnv = process.env) {
+  const kept = {};
+  for (const [key, value] of Object.entries(env)) {
+    const inherited = CONTROL_PLANE_SECRET_ENV_KEYS.has(key.toUpperCase()) && readEnvValueCaseInsensitive(inheritedEnv, key) === value;
+    if (!inherited) kept[key] = value;
+  }
+  return kept;
+}
 function sanitizeRemoteExecutionEnv(env, inheritedEnv = process.env) {
   const sanitized = {};
   for (const [key, value] of Object.entries(env)) {
     const normalizedKey = key.toUpperCase();
+    if (REMOTE_EXECUTION_CONTROL_PLANE_SECRET_KEYS.has(normalizedKey)) {
+      continue;
+    }
     if (!REMOTE_EXECUTION_ENV_IDENTITY_KEYS.has(normalizedKey)) {
       sanitized[key] = value;
       continue;
@@ -61,7 +72,7 @@ function sanitizeRemoteExecutionEnv(env, inheritedEnv = process.env) {
   }
   return sanitized;
 }
-var REMOTE_EXECUTION_ENV_IDENTITY_KEYS;
+var REMOTE_EXECUTION_ENV_IDENTITY_KEYS, CONTROL_PLANE_SECRET_ENV_KEYS, REMOTE_EXECUTION_CONTROL_PLANE_SECRET_KEYS;
 var init_remote_execution_env = __esm({
   "vendor/adapter-utils/src/remote-execution-env.ts"() {
     REMOTE_EXECUTION_ENV_IDENTITY_KEYS = /* @__PURE__ */ new Set([
@@ -80,6 +91,18 @@ var init_remote_execution_env = __esm({
       "XDG_DATA_HOME",
       "XDG_STATE_HOME",
       "XDG_RUNTIME_DIR"
+    ]);
+    CONTROL_PLANE_SECRET_ENV_KEYS = /* @__PURE__ */ new Set([
+      "DATABASE_URL",
+      "BETTER_AUTH_SECRET",
+      "PAPERCLIP_AGENT_JWT_SECRET",
+      "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+      "PAPERCLIP_SECRETS_MASTER_KEY",
+      "PAPERCLIP_SECRETS_MASTER_KEY_FILE"
+    ]);
+    REMOTE_EXECUTION_CONTROL_PLANE_SECRET_KEYS = /* @__PURE__ */ new Set([
+      ...CONTROL_PLANE_SECRET_ENV_KEYS,
+      "OMNIROUTE_API_KEY"
     ]);
   }
 });
@@ -3851,9 +3874,10 @@ async function ensureCommandResolvable(command, cwd, env, options = {}) {
 async function runChildProcess(runId, command, args, opts) {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise((resolve, reject) => {
+    const runEnv = withoutInheritedControlPlaneSecrets(opts.env);
     const rawMerged = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env
+      ...withoutInheritedControlPlaneSecrets(sanitizeInheritedPaperclipEnv(process.env)),
+      ...runEnv
     };
     const CLAUDE_CODE_NESTING_VARS = [
       "CLAUDECODE",
@@ -3870,7 +3894,7 @@ async function runChildProcess(runId, command, args, opts) {
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteEnv: opts.remoteExecution ? runEnv : null,
       localProcessSandbox: opts.localProcessSandbox ?? null
     }).then((target) => {
       const childEnv = { ...mergedEnv, ...target.env };
