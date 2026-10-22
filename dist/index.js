@@ -6322,6 +6322,7 @@ The above agent instructions were loaded from ${resolvedInstructionsFilePath}. R
     const synthesizedExitCode = outcome.failed && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
     const fallbackErrorMessage = outcomeError || stderrLine || `Antigravity exited with code ${synthesizedExitCode ?? -1}`;
     const failed = outcome.failed;
+    const finalResponseText = failed ? "" : (attempt.parsed.response ?? "").trim();
     const provider = inferModelProvider(model);
     return {
       exitCode: synthesizedExitCode,
@@ -6350,7 +6351,8 @@ The above agent instructions were loaded from ${resolvedInstructionsFilePath}. R
         ...attempt.parsed.resultJson ? attempt.parsed.resultJson : {},
         ...attempt.parsed.thinkingTokens !== null ? { thinking_tokens: attempt.parsed.thinkingTokens } : {},
         ...attempt.parsed.tools.length > 0 ? { tool_invocations: attempt.parsed.tools.map((t) => t.name) } : {},
-        ...attempt.parsed.malformedLines > 0 ? { malformed_stream_lines: attempt.parsed.malformedLines } : {}
+        ...attempt.parsed.malformedLines > 0 ? { malformed_stream_lines: attempt.parsed.malformedLines } : {},
+        ...finalResponseText ? { finalResponseDisposition: "final", finalResponseText } : {}
       },
       summary: attempt.parsed.summary || (failed ? fallbackErrorMessage : null),
       clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId)
