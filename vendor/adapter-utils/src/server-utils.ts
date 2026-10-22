@@ -4,7 +4,7 @@ import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE, type ExecutionContinuationEnvelope } from "../../shared-shim.js";
-import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { sanitizeRemoteExecutionEnv, withoutInheritedControlPlaneSecrets } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -4596,9 +4596,12 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    // Adapters often pass `{ ...process.env, ...env }`, which would put the server's secrets back after the sanitized
+    // base, so the run env is filtered too. This one place covers every adapter, local and over ssh.
+    const runEnv = withoutInheritedControlPlaneSecrets(opts.env);
     const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
+      ...withoutInheritedControlPlaneSecrets(sanitizeInheritedPaperclipEnv(process.env)),
+      ...runEnv,
     };
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
@@ -4622,7 +4625,7 @@ export async function runChildProcess(
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteEnv: opts.remoteExecution ? runEnv : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
