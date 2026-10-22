@@ -67,8 +67,21 @@ var init_shared_shim = __esm({
 });
 
 // vendor/adapter-utils/src/remote-execution-env.ts
+var CONTROL_PLANE_SECRET_ENV_KEYS, REMOTE_EXECUTION_CONTROL_PLANE_SECRET_KEYS;
 var init_remote_execution_env = __esm({
   "vendor/adapter-utils/src/remote-execution-env.ts"() {
+    CONTROL_PLANE_SECRET_ENV_KEYS = /* @__PURE__ */ new Set([
+      "DATABASE_URL",
+      "BETTER_AUTH_SECRET",
+      "PAPERCLIP_AGENT_JWT_SECRET",
+      "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+      "PAPERCLIP_SECRETS_MASTER_KEY",
+      "PAPERCLIP_SECRETS_MASTER_KEY_FILE"
+    ]);
+    REMOTE_EXECUTION_CONTROL_PLANE_SECRET_KEYS = /* @__PURE__ */ new Set([
+      ...CONTROL_PLANE_SECRET_ENV_KEYS,
+      "OMNIROUTE_API_KEY"
+    ]);
   }
 });
 
