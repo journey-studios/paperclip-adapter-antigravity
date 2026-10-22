@@ -1,0 +1,8 @@
+# OpenQodex settings for this repo. Every key not set here keeps its default; see: openqodex guide config
+version: 1
+review:
+  paths:
+    # dist/ is committed and rebuilt with the source. Its source maps are a single minified JSON
+    # line each, which the reviewer cannot read, so a change that rebuilt dist/ always came back
+    # as "Review incomplete". The code they map is reviewed through src/ and the dist bundles.
+    exclude: ["**/*.map"]
